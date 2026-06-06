@@ -168,6 +168,9 @@ def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
             fmt = normalize_text_format(body.get(key))
             if fmt:
                 return fmt
+    # А если формат лежит глубже? Проверим ещё body.get("format") как строку
+    if "format" in body:
+        return normalize_text_format(body["format"])
     return None
 
 
@@ -198,9 +201,9 @@ def normalize_outbound_message(
         return text, None, markup
     return text, None, None
 
-
 def clean_media_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    drop = ("callback_id", "url", "size", "width", "height", "duration")
+    # Удаляем только служебные поля, которые точно не нужны при отправке
+    drop = ("callback_id", "size", "width", "height", "duration")
     clean: List[Dict[str, Any]] = []
     for item in attachments:
         if item.get("type") == "inline_keyboard":
@@ -211,7 +214,6 @@ def clean_media_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str,
         safe_payload = {k: v for k, v in payload.items() if k not in drop}
         clean.append({"type": item.get("type"), "payload": safe_payload})
     return clean
-
 
 def apply_replacements(text: str, rules: List[Tuple[str, str]]) -> str:
     out = text or ""
@@ -562,7 +564,9 @@ class MirrorBot:
         msg_body = msg.get("body") or {}
         if not isinstance(msg_body, dict):
             msg_body = {}
+        # Внутри mirror_post, после извлечения
         text, text_fmt, markup = message_body_text_format_markup(msg_body)
+        logger.info("mirror_post: text_fmt=%s, text[:50]=%r", text_fmt, text[:50])
         attachments = msg_body.get("attachments") or []
         if not isinstance(attachments, list):
             attachments = []
