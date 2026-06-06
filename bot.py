@@ -163,13 +163,14 @@ def normalize_text_format(raw: Any) -> Optional[str]:
 
 
 def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
+    # Ищем в нескольких возможных ключах
     for key in ("format", "text_format", "textFormat", "parse_mode", "parseMode"):
         if key in body:
             fmt = normalize_text_format(body.get(key))
             if fmt:
                 return fmt
-    # А если формат лежит глубже? Проверим ещё body.get("format") как строку
-    if "format" in body:
+    # Если ничего не нашли, возможно формат указан как строка в body["format"]
+    if "format" in body and isinstance(body["format"], str):
         return normalize_text_format(body["format"])
     return None
 
@@ -201,8 +202,9 @@ def normalize_outbound_message(
         return text, None, markup
     return text, None, None
 
+
 def clean_media_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Удаляем только служебные поля, которые точно не нужны при отправке
+    # Удаляем только служебные поля, НЕ трогаем url
     drop = ("callback_id", "size", "width", "height", "duration")
     clean: List[Dict[str, Any]] = []
     for item in attachments:
@@ -214,6 +216,7 @@ def clean_media_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str,
         safe_payload = {k: v for k, v in payload.items() if k not in drop}
         clean.append({"type": item.get("type"), "payload": safe_payload})
     return clean
+
 
 def apply_replacements(text: str, rules: List[Tuple[str, str]]) -> str:
     out = text or ""
@@ -360,11 +363,14 @@ class MirrorBot:
             payload: Dict[str, Any] = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
+                payload["text_format"] = text_format  # дубль для совместимости
             if markup:
                 payload["markup"] = markup
             if attachments:
                 payload["attachments"] = attachments
             params = {"user_id": chat_id} if chat_id > 0 else {"chat_id": chat_id}
+            logger.debug("Sending to %s: text=%r, format=%s, attachments=%d",
+                         chat_id, text[:100], text_format, len(attachments) if attachments else 0)
             r = await self.client.post("/messages", params=params, json=payload)
             r.raise_for_status()
             return r.json().get("message")
@@ -385,6 +391,7 @@ class MirrorBot:
             payload: Dict[str, Any] = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
+                payload["text_format"] = text_format
             if markup:
                 payload["markup"] = markup
             if attachments is not None:
@@ -564,18 +571,27 @@ class MirrorBot:
         msg_body = msg.get("body") or {}
         if not isinstance(msg_body, dict):
             msg_body = {}
-        # Внутри mirror_post, после извлечения
         text, text_fmt, markup = message_body_text_format_markup(msg_body)
-        logger.info("mirror_post: text_fmt=%s, text[:50]=%r", text_fmt, text[:50])
         attachments = msg_body.get("attachments") or []
         if not isinstance(attachments, list):
             attachments = []
+
+        # Логируем входящие данные для диагностики
+        logger.info("mirror_post: text_fmt=%s, text_len=%d, attachments=%d",
+                    text_fmt, len(text), len(attachments))
+        if attachments:
+            logger.debug("Attachments types: %s", [a.get("type") for a in attachments if isinstance(a, dict)])
+
+        # Если нет текста и нет вложений – нечего отправлять
+        if not text.strip() and not attachments:
+            logger.info("Пустое сообщение (нет текста и вложений), пропускаем")
+            return
 
         rules = self.config.enabled_rules()
         text = apply_replacements(text, rules)
         markup_out = apply_replacements_deep(markup, rules) if markup else None
         clean = clean_media_attachments(attachments)
-        clean = apply_replacements_deep(clean, rules)
+        # НЕ применяем замены к вложениям (чтобы не портить URL)
 
         result = await self.send_message(
             target,
