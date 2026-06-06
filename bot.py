@@ -1,6 +1,7 @@
 """
 MAX-бот: зеркало постов из группы A в группу B с подменой строк.
 Админка: /admin (ADMIN_USER_IDS из .env).
+Поддерживает markdown/html верстку и медиа (аудио, фото).
 """
 
 from __future__ import annotations
@@ -47,6 +48,180 @@ root_logger.handlers.clear()
 root_logger.addHandler(handler)
 root_logger.setLevel(logging.INFO)
 logger = logging.getLogger("MirrorBot")
+
+# ---------- Вспомогательные функции для работы с версткой (из второго проекта) ----------
+_MARKUP_TYPE_TO_MARKDOWN: Dict[str, Tuple[str, str]] = {
+    "emphasized": ("*", "*"),
+    "emphasis": ("*", "*"),
+    "em": ("*", "*"),
+    "italic": ("*", "*"),
+    "strong": ("**", "**"),
+    "bold": ("**", "**"),
+    "strikethrough": ("~~", "~~"),
+    "underline": ("++", "++"),
+    "code": ("`", "`"),
+    "monospace": ("`", "`"),
+}
+
+_BLOCKQUOTE_SPAN_TYPES = frozenset({
+    "blockquote", "quote", "block_quote", "blockquote_open",
+    "citation", "cite", "quotation", "text_quote", "textquote",
+    "collapsed_quote", "expandable_blockquote", "expandable_quote"
+})
+
+
+def _markdown_pair_for_span_type(typ: str) -> Optional[Tuple[str, str]]:
+    return _MARKUP_TYPE_TO_MARKDOWN.get((typ or "").strip().lower())
+
+
+def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
+    for key in ("url", "link", "href", "uri", "target"):
+        v = s.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _span_looks_like_blockquote(s: Dict[str, Any], typ: str) -> bool:
+    if typ in _BLOCKQUOTE_SPAN_TYPES:
+        return True
+    for key in ("style", "block_type", "blockType", "kind", "variant"):
+        v = s.get(key)
+        if isinstance(v, str) and v.strip().lower() in ("quote", "blockquote", "citation", "cite"):
+            return True
+    if s.get("blockquote") is True or s.get("is_quote") is True or s.get("isQuote") is True:
+        return True
+    return False
+
+
+def _heading_level_from_type_and_dict(typ: str, s: Dict[str, Any]) -> Optional[int]:
+    raw = (typ or "").strip().lower()
+    m = re.match(r"^heading[_\s-]?(\d)$", raw)
+    if m:
+        return max(1, min(6, int(m.group(1))))
+    if len(raw) == 2 and raw[0] == "h" and raw[1].isdigit():
+        return max(1, min(6, int(raw[1])))
+    for key in ("level", "depth", "size", "header_level"):
+        v = s.get(key)
+        if v is None:
+            continue
+        try:
+            return max(1, min(6, int(v)))
+        except (TypeError, ValueError):
+            continue
+    if raw in ("heading", "header", "title"):
+        return 1
+    return None
+
+
+def _span_to_markdown_replacement(out: str, start: int, end: int, s: Dict[str, Any]) -> Optional[str]:
+    chunk = out[start:end]
+    typ = str(s.get("type", "") or "").strip().lower()
+
+    url = _span_url_from_dict(s)
+    if url:
+        return f"[{chunk}]({url})"
+
+    if _span_looks_like_blockquote(s, typ):
+        return "\n".join("> " + line for line in chunk.split("\n"))
+
+    hl = _heading_level_from_type_and_dict(typ, s)
+    if hl is not None:
+        return ("#" * hl) + " " + chunk.lstrip()
+
+    pair = _markdown_pair_for_span_type(typ)
+    if pair:
+        left, right = pair
+        return left + chunk + right
+
+    return None
+
+
+def apply_markup_spans_as_markdown(text: str, markup: List[Dict[str, Any]]) -> str:
+    if not text or not markup:
+        return text
+    spans: List[Tuple[int, int, Dict[str, Any]]] = []
+    for s in markup:
+        if not isinstance(s, dict):
+            continue
+        try:
+            start = int(s["from"])
+            ln = int(s["length"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ln <= 0 or start < 0 or start >= len(text):
+            continue
+        spans.append((start, min(ln, len(text) - start), s))
+    if not spans:
+        return text
+    spans.sort(key=lambda x: (-x[0], x[1]))
+    out = text
+    for start, ln, s in spans:
+        end = start + ln
+        if end > len(out):
+            end = len(out)
+        replacement = _span_to_markdown_replacement(out, start, end, s)
+        if replacement is None:
+            continue
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
+def normalize_outbound_message(
+    text: str,
+    text_format: Optional[str],
+    markup: Optional[List[Dict[str, Any]]],
+) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    """Готовит текст/формат/markup для отправки.
+    Если есть format=markdown и markup - конвертируем спаны в markdown-символы и не шлём markup.
+    Если только markup (без format) - конвертируем в markdown и отправляем format=markdown.
+    Иначе - как есть.
+    """
+    if text_format in ("markdown", "html"):
+        if text_format == "markdown" and markup:
+            md = apply_markup_spans_as_markdown(text, markup)
+            if md != text:
+                return md, "markdown", None
+        return text, text_format, markup if markup else None
+    if markup:
+        md = apply_markup_spans_as_markdown(text, markup)
+        if md != text:
+            return md, "markdown", None
+        logger.warning("normalize_outbound_message: конвертация span->markdown не изменила текст, шлём markup без format")
+        return text, None, markup
+    return text, None, None
+
+
+def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
+    """Ищет поле format в разных вариантах."""
+    for key in ("format", "text_format", "textFormat", "parse_mode", "parseMode"):
+        if key in body:
+            val = body[key]
+            if isinstance(val, str):
+                s = val.strip().lower().replace("-", "_")
+                if s in ("markdown", "md", "mrkdwn"):
+                    return "markdown"
+                if s in ("html", "text_html"):
+                    return "html"
+    return None
+
+
+def copy_markup_from_body(body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    raw = body.get("markup")
+    if not isinstance(raw, list) or not raw:
+        return None
+    return [dict(x) for x in raw if isinstance(x, dict)]
+
+
+def message_body_text_format_markup(
+    body: Dict[str, Any],
+) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    text = body.get("text") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    return text, extract_text_format_from_body(body), copy_markup_from_body(body)
+
+# ---------- Конец функций для верстки ----------
 
 
 def normalize_webhook_url(url: str) -> Tuple[str, str]:
@@ -148,63 +323,8 @@ class AdminState(Enum):
     AWAITING_REPLACE_REPLACE = "awaiting_replace_replace"
 
 
-def normalize_text_format(raw: Any) -> Optional[str]:
-    if raw is None or isinstance(raw, (bool, int)):
-        return None
-    if isinstance(raw, dict):
-        inner = raw.get("type") or raw.get("format")
-        return normalize_text_format(inner) if inner is not None else None
-    s = str(raw).strip().lower().replace("-", "_")
-    if s in ("markdown", "md", "mrkdwn"):
-        return "markdown"
-    if s in ("html", "text_html"):
-        return "html"
-    return None
-
-
-def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
-    # Ищем в нескольких возможных ключах
-    for key in ("format", "text_format", "textFormat", "parse_mode", "parseMode"):
-        if key in body:
-            fmt = normalize_text_format(body.get(key))
-            if fmt:
-                return fmt
-    # Если ничего не нашли, возможно формат указан как строка в body["format"]
-    if "format" in body and isinstance(body["format"], str):
-        return normalize_text_format(body["format"])
-    return None
-
-
-def copy_markup_from_body(body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    raw = body.get("markup")
-    if not isinstance(raw, list) or not raw:
-        return None
-    return [dict(x) for x in raw if isinstance(x, dict)] or None
-
-
-def message_body_text_format_markup(
-    body: Dict[str, Any],
-) -> tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    text = body.get("text") or ""
-    if not isinstance(text, str):
-        text = str(text)
-    return text, extract_text_format_from_body(body), copy_markup_from_body(body)
-
-
-def normalize_outbound_message(
-    text: str,
-    text_format: Optional[str],
-    markup: Optional[List[Dict[str, Any]]],
-) -> tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    if text_format in ("markdown", "html"):
-        return text, text_format, markup if markup else None
-    if markup:
-        return text, None, markup
-    return text, None, None
-
-
 def clean_media_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Удаляем только служебные поля, НЕ трогаем url
+    """Очищает вложения для пересылки. НЕ удаляем url, иначе аудио/фото не уходят."""
     drop = ("callback_id", "size", "width", "height", "duration")
     clean: List[Dict[str, Any]] = []
     for item in attachments:
@@ -363,14 +483,11 @@ class MirrorBot:
             payload: Dict[str, Any] = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
-                payload["text_format"] = text_format  # дубль для совместимости
             if markup:
                 payload["markup"] = markup
             if attachments:
                 payload["attachments"] = attachments
             params = {"user_id": chat_id} if chat_id > 0 else {"chat_id": chat_id}
-            logger.debug("Sending to %s: text=%r, format=%s, attachments=%d",
-                         chat_id, text[:100], text_format, len(attachments) if attachments else 0)
             r = await self.client.post("/messages", params=params, json=payload)
             r.raise_for_status()
             return r.json().get("message")
@@ -391,7 +508,6 @@ class MirrorBot:
             payload: Dict[str, Any] = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
-                payload["text_format"] = text_format
             if markup:
                 payload["markup"] = markup
             if attachments is not None:
@@ -576,29 +692,30 @@ class MirrorBot:
         if not isinstance(attachments, list):
             attachments = []
 
-        # Логируем входящие данные для диагностики
         logger.info("mirror_post: text_fmt=%s, text_len=%d, attachments=%d",
                     text_fmt, len(text), len(attachments))
-        if attachments:
-            logger.debug("Attachments types: %s", [a.get("type") for a in attachments if isinstance(a, dict)])
 
         # Если нет текста и нет вложений – нечего отправлять
         if not text.strip() and not attachments:
-            logger.info("Пустое сообщение (нет текста и вложений), пропускаем")
+            logger.info("Пустое сообщение, пропускаем")
             return
 
         rules = self.config.enabled_rules()
         text = apply_replacements(text, rules)
-        markup_out = apply_replacements_deep(markup, rules) if markup else None
-        clean = clean_media_attachments(attachments)
-        # НЕ применяем замены к вложениям (чтобы не портить URL)
+        # Применяем замены к разметке, если есть (осторожно, может сломать ссылки)
+        if markup:
+            markup = apply_replacements_deep(markup, rules)
+        # Очищаем вложения, но НЕ удаляем url
+        clean_attachments = clean_media_attachments(attachments)
+        # Применяем замены к вложениям? Лучше не надо – могут быть ссылки на файлы.
+        # clean_attachments = apply_replacements_deep(clean_attachments, rules)
 
         result = await self.send_message(
             target,
             text,
-            clean if clean else None,
+            clean_attachments if clean_attachments else None,
             text_format=text_fmt,
-            markup=markup_out if isinstance(markup_out, list) else markup,
+            markup=markup if markup else None,
         )
         if result:
             logger.info("Зеркало: %s → %s, mid=%s", source, target, _mid_from_message_dict(result))
