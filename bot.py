@@ -133,7 +133,7 @@ def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
-    
+
 def _span_to_html_replacement(out: str, start: int, end: int, s: Dict[str, Any]) -> Optional[str]:
     chunk = out[start:end]
     typ = str(s.get("type", "") or "").strip().lower()
@@ -158,38 +158,69 @@ def _span_to_html_replacement(out: str, start: int, end: int, s: Dict[str, Any])
     return None
 
 def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
-    """Рекурсивно применяет спаны, преобразуя в HTML."""
+    """Применяет спаны, преобразуя в HTML. Заголовки применяются последними."""
     if not text or not markup:
         return text
 
-    spans = []
+    # Разделяем спаны на заголовочные и остальные
+    heading_spans = []
+    other_spans = []
     for s in markup:
-        try:
-            start = int(s["from"])
-            length = int(s["length"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if length <= 0 or start < 0 or start >= len(text):
-            continue
-        end = min(start + length, len(text))
-        spans.append((start, end, s))
-    if not spans:
-        return text
-    spans.sort(key=lambda x: x[1] - x[0], reverse=True)
-
-    out = text
-    for start, end, s in spans:
-        replacement = _span_to_html_replacement(out, start, end, s)
-        if replacement is None:
-            continue
-        new_out = out[:start] + replacement + out[end:]
-        remaining = [span_data for span_data in markup if span_data != s]
-        if remaining:
-            return apply_markup_spans_as_html(new_out, remaining)
+        typ = str(s.get("type", "")).lower()
+        if typ.startswith("heading") or typ in ("header", "title"):
+            heading_spans.append(s)
         else:
-            return new_out
-    return out
+            other_spans.append(s)
 
+    # Сначала применяем все остальные стили, получаем HTML-текст
+    current_text = text
+    if other_spans:
+        # Сортируем другие спаны по убыванию длины, чтобы сначала обрабатывать самые длинные
+        other_spans_sorted = sorted(other_spans, key=lambda x: x.get("length", 0), reverse=True)
+        for s in other_spans_sorted:
+            try:
+                start = int(s["from"])
+                length = int(s["length"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if length <= 0 or start < 0 or start >= len(current_text):
+                continue
+            end = min(start + length, len(current_text))
+            chunk = current_text[start:end]
+            replacement = _span_to_html_replacement(chunk, start, end, s)  # изменённая сигнатура
+            if replacement is not None:
+                current_text = current_text[:start] + replacement + current_text[end:]
+                # Сдвиг: все последующие спаны должны быть пересчитаны. Для простоты перезапускаем процесс.
+                # Можно рекурсивно применить оставшиеся спаны, но здесь упростим: просто пересоздадим список
+                # оставшихся other_spans (кроме текущего) и применим их к новому тексту.
+                remaining = [s2 for s2 in other_spans if s2 != s]
+                if remaining:
+                    return apply_markup_spans_as_html(current_text, remaining + heading_spans)
+                else:
+                    # Применили все остальные, переходим к заголовкам
+                    break
+
+    # Теперь обрабатываем заголовки (если есть)
+    if heading_spans:
+        # Заголовки могут быть вложенными? Обычно один заголовок на диапазон.
+        # Берём самый длинный заголовок (или все по очереди)
+        for hs in heading_spans:
+            try:
+                start = int(hs["from"])
+                length = int(hs["length"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if length <= 0 or start < 0 or start >= len(current_text):
+                continue
+            end = min(start + length, len(current_text))
+            chunk = current_text[start:end]
+            replacement = _span_to_html_replacement(chunk, start, end, hs)
+            if replacement is not None:
+                current_text = current_text[:start] + replacement + current_text[end:]
+                # Заголовок обернул всё, больше не обрабатываем другие заголовки
+                break
+    return current_text
+    
 def normalize_outbound_message(
     text: str,
     text_format: Optional[str],
