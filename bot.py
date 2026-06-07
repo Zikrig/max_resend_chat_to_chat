@@ -134,27 +134,44 @@ def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
             return v.strip()
     return None
 
-def _span_to_html_replacement(out: str, start: int, end: int, s: Dict[str, Any]) -> Optional[str]:
-    chunk = out[start:end]
+def _heading_level_from_type_and_dict(typ: str, s: Dict[str, Any]) -> Optional[int]:
+    raw = (typ or "").strip().lower()
+    # "heading_2" -> 2
+    m = re.match(r"^heading[_\s-]?(\d)$", raw)
+    if m:
+        return max(1, min(6, int(m.group(1))))
+    # "h3" -> 3
+    if len(raw) == 2 and raw[0] == "h" and raw[1].isdigit():
+        return max(1, min(6, int(raw[1])))
+    # Поля в словаре: level, depth, size
+    for key in ("level", "depth", "size", "header_level"):
+        v = s.get(key)
+        if v is not None:
+            try:
+                return max(1, min(6, int(v)))
+            except (TypeError, ValueError):
+                continue
+    # Если ничего не нашли, но тип явно заголовок — уровень 1
+    if raw in ("heading", "header", "title"):
+        return 1
+    return None
+    
+def _span_to_html_replacement(chunk: str, s: Dict[str, Any]) -> Optional[str]:
     typ = str(s.get("type", "") or "").strip().lower()
-
     url = _span_url_from_dict(s)
     if url:
         return f'<a href="{url}">{chunk}</a>'
-
-    # Цитата (если вдруг)
     if typ in ("quote", "blockquote", "citation"):
         return f"<blockquote>{chunk}</blockquote>"
-
-    # Заголовок -> жирный + возможно увеличение шрифта, но для простоты сделаем <b>
     if typ.startswith("heading") or typ in ("header", "title"):
-        return f"<b>{chunk}</b>"
-
+        level = _heading_level_from_type_and_dict(typ, s)
+        if level is None:
+            level = 1
+        return f"<h{level}>{chunk}</h{level}>"
     pair = _html_pair_for_span_type(typ)
     if pair:
         left, right = pair
         return left + chunk + right
-
     return None
 
 def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
@@ -220,7 +237,7 @@ def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
                 # Заголовок обернул всё, больше не обрабатываем другие заголовки
                 break
     return current_text
-    
+
 def normalize_outbound_message(
     text: str,
     text_format: Optional[str],
