@@ -1,7 +1,9 @@
 """
 MAX-бот: зеркало постов из группы A в группу B с подменой строк.
 Админка: /admin (ADMIN_USER_IDS из .env).
-Поддерживает markdown/html верстку (кроме цитат) и медиа (аудио не работает).
+Поддерживает markdown/html верстку (жирный, курсив, подчеркивание, ссылки).
+Цитаты работают через эвристику (> текст).
+Заголовки преобразуются в жирный текст.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ root_logger.addHandler(handler)
 root_logger.setLevel(logging.INFO)
 logger = logging.getLogger("MirrorBot")
 
-# ---------- Функции для работы с версткой (исправленная) ----------
+# ---------- Функции для работы с версткой ----------
 
 def normalize_text_format(raw: Any) -> Optional[str]:
     if raw is None:
@@ -120,30 +122,11 @@ def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
             return v.strip()
     return None
 
-def _heading_level_from_type_and_dict(typ: str, s: Dict[str, Any]) -> Optional[int]:
-    raw = (typ or "").strip().lower()
-    m = re.match(r"^heading[_\s-]?(\d)$", raw)
-    if m:
-        return max(1, min(6, int(m.group(1))))
-    if len(raw) == 2 and raw[0] == "h" and raw[1].isdigit():
-        return max(1, min(6, int(raw[1])))
-    for key in ("level", "depth", "size", "header_level"):
-        v = s.get(key)
-        if v is None:
-            continue
-        try:
-            return max(1, min(6, int(v)))
-        except (TypeError, ValueError):
-            continue
-    if raw in ("heading", "header", "title"):
-        return 1
-    return None
-
 def _span_to_markdown_replacement(out: str, start: int, end: int, s: Dict[str, Any]) -> Optional[str]:
     chunk = out[start:end]
     typ = str(s.get("type", "") or "").strip().lower()
 
-    # Ссылка
+    # Ссылка (приоритет)
     url = _span_url_from_dict(s)
     if url:
         return f"[{chunk}]({url})"
@@ -152,10 +135,12 @@ def _span_to_markdown_replacement(out: str, start: int, end: int, s: Dict[str, A
     if typ in ("quote", "blockquote", "citation"):
         return "\n".join("> " + line for line in chunk.split("\n"))
 
-    # Заголовок
-    hl = _heading_level_from_type_and_dict(typ, s)
-    if hl is not None:
-        return ("#" * hl) + " " + chunk.lstrip()
+    # Заголовок -> преобразуем в жирный текст (strong), чтобы сохранить вложенные стили
+    if typ.startswith("heading") or typ in ("header", "title"):
+        pair = _markdown_pair_for_span_type("strong")
+        if pair:
+            left, right = pair
+            return left + chunk + right
 
     # Обычные стили
     pair = _markdown_pair_for_span_type(typ)
@@ -178,7 +163,6 @@ def apply_markup_spans_as_markdown(text: str, markup: List[Dict[str, Any]]) -> s
         try:
             start = int(s["from"])
             length = int(s["length"])
-            typ = s.get("type", "").lower()
         except (KeyError, TypeError, ValueError):
             continue
         if length <= 0 or start < 0 or start >= len(text):
@@ -190,29 +174,20 @@ def apply_markup_spans_as_markdown(text: str, markup: List[Dict[str, Any]]) -> s
     spans.sort(key=lambda x: x[1] - x[0], reverse=True)  # по убыванию длины
 
     out = text
-    # Для каждого спана применяем замену, смещая индексы для последующих
+    # Для каждого спана применяем замену, рекурсивно обрабатывая оставшиеся спаны
     for start, end, s in spans:
         replacement = _span_to_markdown_replacement(out, start, end, s)
         if replacement is None:
             continue
-        out = out[:start] + replacement + out[end:]
-        # Смещаем индексы следующих спанов (более коротких) на разницу в длине
-        delta = len(replacement) - (end - start)
-        # Пересоздаём список спанов с новыми индексами (упрощённо: просто пересобираем)
-        # Для простоты можно не пересчитывать, а перезапустить всю функцию заново.
-        # Но так как спанов обычно мало, можно рекурсивно применить к новому тексту оставшиеся спаны.
-        # Эффективнее: собрать оставшиеся спаны (кроме текущего) и применить их к новому out.
-        remaining = []
-        for s2 in markup:
-            if s2 == s:
-                continue
-            # Грубая оценка: пересчёт смещений сложен, проще рекурсия
-            remaining.append(s2)
+        new_out = out[:start] + replacement + out[end:]
+        # Оставшиеся спаны (кроме текущего) применяем к новому тексту
+        remaining = [span_data for span_data in markup if span_data != s]
         if remaining:
-            return apply_markup_spans_as_markdown(out, remaining)
+            return apply_markup_spans_as_markdown(new_out, remaining)
         else:
-            return out
+            return new_out
     return out
+
 def normalize_outbound_message(
     text: str,
     text_format: Optional[str],
@@ -675,26 +650,30 @@ class MirrorBot:
         if not isinstance(msg_body, dict):
             msg_body = {}
         text, text_fmt, markup = message_body_text_format_markup(msg_body)
-            # Эвристика для цитат: если строка начинается с >, превращаем в markdown-цитату
-        lines = text.split('\n')
-        new_lines = []
-        for line in lines:
-            stripped = line.lstrip()
-            if stripped.startswith('>'):
-                content = line[line.index('>')+1:].lstrip()
-                new_lines.append(f'> {content}')
-            else:
-                new_lines.append(line)
-        text = '\n'.join(new_lines)
-        # Если были изменения и нет явного format, включаем markdown
-        if new_lines != lines and text_fmt is None:
-            text_fmt = "markdown"
         attachments = msg_body.get("attachments") or []
         if not isinstance(attachments, list):
             attachments = []
 
         logger.info("mirror_post: text_fmt=%s, text_len=%d, attachments=%d",
                     text_fmt, len(text), len(attachments))
+
+        # ===== Эвристика для цитат =====
+        lines = text.split('\n')
+        new_lines = []
+        modified = False
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith('>'):
+                content = line[line.index('>')+1:].lstrip()
+                new_lines.append(f'> {content}')
+                modified = True
+            else:
+                new_lines.append(line)
+        if modified:
+            text = '\n'.join(new_lines)
+            if text_fmt is None:
+                text_fmt = "markdown"
+        # ===== Конец эвристики =====
 
         if not text.strip() and not attachments:
             logger.info("Пустое сообщение, пропускаем")
