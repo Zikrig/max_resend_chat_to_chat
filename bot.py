@@ -1,6 +1,7 @@
 """
 MAX-бот: зеркало постов из группы A в группу B с подменой строк.
 Админка: /admin (ADMIN_USER_IDS из .env).
+Поддерживает markdown/html верстку (кроме цитат) и медиа (аудио не работает).
 """
 
 from __future__ import annotations
@@ -48,6 +49,191 @@ root_logger.addHandler(handler)
 root_logger.setLevel(logging.INFO)
 logger = logging.getLogger("MirrorBot")
 
+# ---------- Функции для работы с версткой (исправленная) ----------
+
+def normalize_text_format(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        inner = raw.get("type") or raw.get("name") or raw.get("value") or raw.get("format")
+        if inner is not None:
+            return normalize_text_format(inner)
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return None
+    s = str(raw).strip().lower().replace("-", "_")
+    if s in ("markdown", "md", "mrkdwn"):
+        return "markdown"
+    if s in ("html", "text_html"):
+        return "html"
+    return None
+
+def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
+    for key in ("format", "text_format", "textFormat", "parse_mode", "parseMode", "text_style", "textStyle"):
+        if key in body:
+            fmt = normalize_text_format(body.get(key))
+            if fmt:
+                return fmt
+    return None
+
+def copy_markup_from_body(body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    raw = body.get("markup")
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        out.append(dict(item))
+    return out or None
+
+def message_body_text_format_markup(
+    body: Dict[str, Any],
+) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    text = body.get("text") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    return text, extract_text_format_from_body(body), copy_markup_from_body(body)
+
+_MARKUP_TYPE_TO_MARKDOWN: Dict[str, Tuple[str, str]] = {
+    "emphasized": ("*", "*"),
+    "emphasis": ("*", "*"),
+    "em": ("*", "*"),
+    "italic": ("*", "*"),
+    "strong": ("**", "**"),
+    "bold": ("**", "**"),
+    "strikethrough": ("~~", "~~"),
+    "underline": ("++", "++"),
+    "code": ("`", "`"),
+    "monospace": ("`", "`"),
+}
+
+def _markdown_pair_for_span_type(typ: str) -> Optional[Tuple[str, str]]:
+    return _MARKUP_TYPE_TO_MARKDOWN.get((typ or "").strip().lower())
+
+def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
+    for key in ("url", "link", "href", "uri", "target"):
+        v = s.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def _heading_level_from_type_and_dict(typ: str, s: Dict[str, Any]) -> Optional[int]:
+    raw = (typ or "").strip().lower()
+    m = re.match(r"^heading[_\s-]?(\d)$", raw)
+    if m:
+        return max(1, min(6, int(m.group(1))))
+    if len(raw) == 2 and raw[0] == "h" and raw[1].isdigit():
+        return max(1, min(6, int(raw[1])))
+    for key in ("level", "depth", "size", "header_level"):
+        v = s.get(key)
+        if v is None:
+            continue
+        try:
+            return max(1, min(6, int(v)))
+        except (TypeError, ValueError):
+            continue
+    if raw in ("heading", "header", "title"):
+        return 1
+    return None
+
+def _span_to_markdown_replacement(out: str, start: int, end: int, s: Dict[str, Any]) -> Optional[str]:
+    chunk = out[start:end]
+    typ = str(s.get("type", "") or "").strip().lower()
+
+    url = _span_url_from_dict(s)
+    if url:
+        return f"[{chunk}]({url})"
+
+    hl = _heading_level_from_type_and_dict(typ, s)
+    if hl is not None:
+        return ("#" * hl) + " " + chunk.lstrip()
+
+    pair = _markdown_pair_for_span_type(typ)
+    if pair:
+        left, right = pair
+        return left + chunk + right
+
+    return None
+
+def apply_markup_spans_as_markdown(text: str, markup: List[Dict[str, Any]]) -> str:
+    """Исправленная версия: корректно обрабатывает наложение стилей."""
+    if not text or not markup:
+        return text
+
+    # Для каждой позиции символа собираем все активные типы разметки
+    types_per_pos = [set() for _ in range(len(text))]
+    for span in markup:
+        try:
+            start = int(span["from"])
+            length = int(span["length"])
+            typ = span.get("type", "").lower()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if length <= 0 or start < 0 or start >= len(text):
+            continue
+        end = min(start + length, len(text))
+        for i in range(start, end):
+            types_per_pos[i].add(typ)
+
+    def markers_for_types(types: set) -> Tuple[str, str]:
+        parts = []
+        if "strong" in types or "bold" in types:
+            parts.append("**")
+        if "emphasized" in types or "italic" in types:
+            parts.append("*")
+        if "strikethrough" in types:
+            parts.append("~~")
+        if "underline" in types:
+            parts.append("++")
+        if not parts:
+            return "", ""
+        open_seq = "".join(parts)
+        close_seq = "".join(reversed(parts))
+        return open_seq, close_seq
+
+    # Склеиваем символы с одинаковым набором типов
+    result_parts = []
+    i = 0
+    while i < len(text):
+        current_types = types_per_pos[i]
+        j = i + 1
+        while j < len(text) and types_per_pos[j] == current_types:
+            j += 1
+        chunk = text[i:j]
+        open_m, close_m = markers_for_types(current_types)
+        # Обработка заголовка: если есть heading и это начало строки/текста
+        if "heading" in current_types and i == 0:
+            result_parts.append("# ")
+            result_parts.append(chunk)
+        elif open_m:
+            result_parts.append(open_m)
+            result_parts.append(chunk)
+            result_parts.append(close_m)
+        else:
+            result_parts.append(chunk)
+        i = j
+
+    return "".join(result_parts)
+
+def normalize_outbound_message(
+    text: str,
+    text_format: Optional[str],
+    markup: Optional[List[Dict[str, Any]]],
+) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    if text_format in ("markdown", "html"):
+        return text, text_format, markup if markup else None
+    if markup:
+        md = apply_markup_spans_as_markdown(text, markup)
+        if md != text:
+            return md, "markdown", None
+        logger.warning("span→markdown не изменил текст, шлём markup без format")
+        return text, None, markup
+    return text, None, None
+
+# ---------- Конец функций для верстки ----------
 
 def normalize_webhook_url(url: str) -> Tuple[str, str]:
     raw = url.strip()
@@ -64,7 +250,6 @@ def normalize_webhook_url(url: str) -> Tuple[str, str]:
         path = "/" + path
     return f"https://{p.netloc}{path}", path
 
-
 def parse_listen_host_port(raw: str) -> Tuple[str, int]:
     s = raw.strip()
     if ":" not in s:
@@ -77,7 +262,6 @@ def parse_listen_host_port(raw: str) -> Tuple[str, int]:
     except ValueError:
         raise ValueError(f"Некорректный порт в WEBHOOK_LISTEN: {raw!r}") from None
     return host, port
-
 
 def parse_admin_ids(raw: Any) -> List[int]:
     if raw is None:
@@ -94,7 +278,6 @@ def parse_admin_ids(raw: Any) -> List[int]:
             logger.warning("Пропуск неверного admin id: %s", part)
     return sorted(set(result))
 
-
 def message_mid_from_callback_update(update: Dict[str, Any]) -> Optional[str]:
     cb = update.get("callback")
     if isinstance(cb, dict):
@@ -103,7 +286,6 @@ def message_mid_from_callback_update(update: Dict[str, Any]) -> Optional[str]:
             if mid:
                 return mid
     return _mid_from_message_dict(update.get("message"))
-
 
 def _mid_from_message_dict(msg: Any) -> Optional[str]:
     if not isinstance(msg, dict):
@@ -120,7 +302,6 @@ def _mid_from_message_dict(msg: Any) -> Optional[str]:
             return str(raw)
     return None
 
-
 async def max_subscribe_webhook(client: httpx.AsyncClient, url: str, secret: Optional[str]) -> None:
     payload: Dict[str, Any] = {
         "url": url,
@@ -134,11 +315,9 @@ async def max_subscribe_webhook(client: httpx.AsyncClient, url: str, secret: Opt
     if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(data.get("message") or "POST /subscriptions вернул success=false")
 
-
 async def max_unsubscribe_webhook(client: httpx.AsyncClient, url: str) -> None:
     r = await client.delete("/subscriptions", params={"url": url})
     r.raise_for_status()
-
 
 class AdminState(Enum):
     NONE = "none"
@@ -147,64 +326,7 @@ class AdminState(Enum):
     AWAITING_REPLACE_SEARCH = "awaiting_replace_search"
     AWAITING_REPLACE_REPLACE = "awaiting_replace_replace"
 
-
-def normalize_text_format(raw: Any) -> Optional[str]:
-    if raw is None or isinstance(raw, (bool, int)):
-        return None
-    if isinstance(raw, dict):
-        inner = raw.get("type") or raw.get("format")
-        return normalize_text_format(inner) if inner is not None else None
-    s = str(raw).strip().lower().replace("-", "_")
-    if s in ("markdown", "md", "mrkdwn"):
-        return "markdown"
-    if s in ("html", "text_html"):
-        return "html"
-    return None
-
-
-def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
-    # Ищем в нескольких возможных ключах
-    for key in ("format", "text_format", "textFormat", "parse_mode", "parseMode"):
-        if key in body:
-            fmt = normalize_text_format(body.get(key))
-            if fmt:
-                return fmt
-    # Если ничего не нашли, возможно формат указан как строка в body["format"]
-    if "format" in body and isinstance(body["format"], str):
-        return normalize_text_format(body["format"])
-    return None
-
-
-def copy_markup_from_body(body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    raw = body.get("markup")
-    if not isinstance(raw, list) or not raw:
-        return None
-    return [dict(x) for x in raw if isinstance(x, dict)] or None
-
-
-def message_body_text_format_markup(
-    body: Dict[str, Any],
-) -> tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    text = body.get("text") or ""
-    if not isinstance(text, str):
-        text = str(text)
-    return text, extract_text_format_from_body(body), copy_markup_from_body(body)
-
-
-def normalize_outbound_message(
-    text: str,
-    text_format: Optional[str],
-    markup: Optional[List[Dict[str, Any]]],
-) -> tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    if text_format in ("markdown", "html"):
-        return text, text_format, markup if markup else None
-    if markup:
-        return text, None, markup
-    return text, None, None
-
-
 def clean_media_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Удаляем только служебные поля, НЕ трогаем url
     drop = ("callback_id", "size", "width", "height", "duration")
     clean: List[Dict[str, Any]] = []
     for item in attachments:
@@ -217,14 +339,12 @@ def clean_media_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str,
         clean.append({"type": item.get("type"), "payload": safe_payload})
     return clean
 
-
 def apply_replacements(text: str, rules: List[Tuple[str, str]]) -> str:
     out = text or ""
     for search, replace in rules:
         if search:
             out = out.replace(search, replace)
     return out
-
 
 def apply_replacements_deep(obj: Any, rules: List[Tuple[str, str]]) -> Any:
     if isinstance(obj, str):
@@ -235,22 +355,18 @@ def apply_replacements_deep(obj: Any, rules: List[Tuple[str, str]]) -> Any:
         return [apply_replacements_deep(x, rules) for x in obj]
     return obj
 
-
 def normalize_max_url(url: str) -> str:
     u = (url or "").strip()
     if not u.startswith("http"):
         u = "https://" + u
     return u.rstrip("/")
 
-
 def extract_join_token(url: str) -> str:
     m = re.search(r"/join/([^/?#]+)", url, re.IGNORECASE)
     return m.group(1) if m else ""
 
-
 def links_match(a: str, b: str) -> bool:
     return normalize_max_url(a).lower() == normalize_max_url(b).lower()
-
 
 def try_parse_chat_id_from_text(text: str) -> Optional[int]:
     raw = text.strip()
@@ -267,14 +383,12 @@ def try_parse_chat_id_from_text(text: str) -> Optional[int]:
             return None
     return None
 
-
 def _chat_title_from_api(d: Optional[Dict[str, Any]]) -> str:
     if not d or not isinstance(d, dict):
         return ""
     inner = d.get("chat")
     u = inner if isinstance(inner, dict) else d
     return str(u.get("title") or u.get("name") or "").strip()
-
 
 def _prompt_cancel_keyboard(payload: str) -> List[Dict]:
     return [
@@ -285,7 +399,6 @@ def _prompt_cancel_keyboard(payload: str) -> List[Dict]:
             },
         }
     ]
-
 
 class MirrorConfig:
     def __init__(self, db_path: str | None = None):
@@ -328,7 +441,6 @@ class MirrorConfig:
         self.reload()
         return ok
 
-
 class MirrorBot:
     def __init__(self, token: str, config: MirrorConfig):
         self.token = token
@@ -363,14 +475,11 @@ class MirrorBot:
             payload: Dict[str, Any] = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
-                payload["text_format"] = text_format  # дубль для совместимости
             if markup:
                 payload["markup"] = markup
             if attachments:
                 payload["attachments"] = attachments
             params = {"user_id": chat_id} if chat_id > 0 else {"chat_id": chat_id}
-            logger.debug("Sending to %s: text=%r, format=%s, attachments=%d",
-                         chat_id, text[:100], text_format, len(attachments) if attachments else 0)
             r = await self.client.post("/messages", params=params, json=payload)
             r.raise_for_status()
             return r.json().get("message")
@@ -391,7 +500,6 @@ class MirrorBot:
             payload: Dict[str, Any] = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
-                payload["text_format"] = text_format
             if markup:
                 payload["markup"] = markup
             if attachments is not None:
@@ -576,29 +684,25 @@ class MirrorBot:
         if not isinstance(attachments, list):
             attachments = []
 
-        # Логируем входящие данные для диагностики
         logger.info("mirror_post: text_fmt=%s, text_len=%d, attachments=%d",
                     text_fmt, len(text), len(attachments))
-        if attachments:
-            logger.debug("Attachments types: %s", [a.get("type") for a in attachments if isinstance(a, dict)])
 
-        # Если нет текста и нет вложений – нечего отправлять
         if not text.strip() and not attachments:
-            logger.info("Пустое сообщение (нет текста и вложений), пропускаем")
+            logger.info("Пустое сообщение, пропускаем")
             return
 
         rules = self.config.enabled_rules()
         text = apply_replacements(text, rules)
-        markup_out = apply_replacements_deep(markup, rules) if markup else None
-        clean = clean_media_attachments(attachments)
-        # НЕ применяем замены к вложениям (чтобы не портить URL)
+        if markup:
+            markup = apply_replacements_deep(markup, rules)
+        clean_attachments = clean_media_attachments(attachments)
 
         result = await self.send_message(
             target,
             text,
-            clean if clean else None,
+            clean_attachments if clean_attachments else None,
             text_format=text_fmt,
-            markup=markup_out if isinstance(markup_out, list) else markup,
+            markup=markup if markup else None,
         )
         if result:
             logger.info("Зеркало: %s → %s, mid=%s", source, target, _mid_from_message_dict(result))
@@ -769,7 +873,6 @@ class MirrorBot:
                     prepend=rep.REPLACEMENT_REMOVED,
                 )
 
-
 async def run_webhook_server(
     bot: MirrorBot,
     webhook_url: str,
@@ -837,14 +940,12 @@ async def run_webhook_server(
             except Exception as e:
                 logger.warning("Отписка webhook: %s", e)
 
-
 def _sqlite_paths_from_env() -> tuple[str, str]:
     raw_db = (os.environ.get("SQLITE_PATH") or "").strip()
     db_path = raw_db or os.path.join("data", "app.db")
     raw_b = (os.environ.get("SQLITE_BACKUP_DIR") or "").strip()
     backup_dir = raw_b or os.path.join("data", "backups")
     return db_path, backup_dir
-
 
 async def daily_sqlite_backup_loop() -> None:
     db_path, backup_dir = _sqlite_paths_from_env()
@@ -856,7 +957,6 @@ async def daily_sqlite_backup_loop() -> None:
             config_store.backup_now(db_path, backup_dir)
         except Exception:
             logger.exception("Ежедневный дамп SQLite не удался")
-
 
 async def main() -> None:
     token = os.environ.get("MAX_BOT_TOKEN")
@@ -891,7 +991,6 @@ async def main() -> None:
         except asyncio.CancelledError:
             pass
         await bot.client.aclose()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
