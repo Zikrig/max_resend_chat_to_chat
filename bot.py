@@ -58,13 +58,60 @@ def normalize_outbound_message(
     text_format: Optional[str],
     markup: Optional[List[Dict[str, Any]]],
 ) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    # Если есть явный формат (markdown/html) от админа – используем как есть
     if text_format in ("markdown", "html"):
         return text, text_format, markup if markup else None
     # Для обычных сообщений: отправляем исходный текст и markup, format не ставим
     return text, None, markup if markup else None
 
+# ---------- Базовые функции для работы с версткой (без конвертации) ----------
 
+def normalize_text_format(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        inner = raw.get("type") or raw.get("name") or raw.get("value") or raw.get("format")
+        if inner is not None:
+            return normalize_text_format(inner)
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return None
+    s = str(raw).strip().lower().replace("-", "_")
+    if s in ("markdown", "md", "mrkdwn"):
+        return "markdown"
+    if s in ("html", "text_html"):
+        return "html"
+    return None
+
+def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
+    for key in ("format", "text_format", "textFormat", "parse_mode", "parseMode", "text_style", "textStyle"):
+        if key in body:
+            fmt = normalize_text_format(body.get(key))
+            if fmt:
+                return fmt
+    return None
+
+def copy_markup_from_body(body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    raw = body.get("markup")
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        out.append(dict(item))
+    return out or None
+
+def message_body_text_format_markup(
+    body: Dict[str, Any],
+) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    text = body.get("text") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    return text, extract_text_format_from_body(body), copy_markup_from_body(body)
+
+# ---------- Конец базовых функций ----------
 
 # ---------- Конец функций для верстки ----------
 
