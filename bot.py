@@ -1,9 +1,8 @@
 """
 MAX-бот: зеркало постов из группы A в группу B с подменой строк.
 Админка: /admin (ADMIN_USER_IDS из .env).
-Поддерживает markdown/html верстку (жирный, курсив, подчеркивание, ссылки).
-Цитаты работают через эвристику (> текст).
-Заголовки преобразуются в жирный текст.
+Верстка работает через передачу markup без format (без конвертации).
+Цитаты не поддерживаются.
 """
 
 from __future__ import annotations
@@ -51,19 +50,7 @@ root_logger.addHandler(handler)
 root_logger.setLevel(logging.INFO)
 logger = logging.getLogger("MirrorBot")
 
-# ---------- Функции для работы с версткой ----------
-
-def normalize_outbound_message(
-    text: str,
-    text_format: Optional[str],
-    markup: Optional[List[Dict[str, Any]]],
-) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    if text_format in ("markdown", "html"):
-        return text, text_format, markup if markup else None
-    # Для обычных сообщений: отправляем исходный текст и markup, format не ставим
-    return text, None, markup if markup else None
-
-# ---------- Базовые функции для работы с версткой (без конвертации) ----------
+# ---------- Функции для работы с версткой (только извлечение) ----------
 
 def normalize_text_format(raw: Any) -> Optional[str]:
     if raw is None:
@@ -111,7 +98,16 @@ def message_body_text_format_markup(
         text = str(text)
     return text, extract_text_format_from_body(body), copy_markup_from_body(body)
 
-# ---------- Конец базовых функций ----------
+def normalize_outbound_message(
+    text: str,
+    text_format: Optional[str],
+    markup: Optional[List[Dict[str, Any]]],
+) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    # Если есть явный format (от админа) – используем его, markup не трогаем
+    if text_format in ("markdown", "html"):
+        return text, text_format, markup if markup else None
+    # Для всех остальных: отправляем исходный текст и markup, format не ставим
+    return text, None, markup if markup else None
 
 # ---------- Конец функций для верстки ----------
 
@@ -342,21 +338,21 @@ class MirrorBot:
         self.bot_id = data.get("user_id")
         logger.info("Logged in as bot ID %s (@%s)", self.bot_id, data.get("username"))
 
-    async def send_message(self, chat_id, text, attachments=None, text_format=None, markup=None):
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        attachments: Optional[List[Dict]] = None,
+        text_format: Optional[str] = None,
+        markup: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict]:
         try:
-            logger.info("=== SEND_DEBUG: before normalize: text=%r, text_format=%r, markup=%s", 
-                        text[:100], text_format, bool(markup))
             text, text_format, markup = normalize_outbound_message(text, text_format, markup)
-            logger.info("=== SEND_DEBUG: after normalize: text=%r, text_format=%r, markup=%s", 
-                        text[:100], text_format, bool(markup))
-            payload = {"text": text}
+            payload: Dict[str, Any] = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
-                logger.info("=== SEND_DEBUG: setting format=%s", text_format)
             if markup:
                 payload["markup"] = markup
-                logger.info("=== SEND_DEBUG: adding markup with %d spans", len(markup))
-
             if attachments:
                 payload["attachments"] = attachments
             params = {"user_id": chat_id} if chat_id > 0 else {"chat_id": chat_id}
@@ -564,26 +560,8 @@ class MirrorBot:
         if not isinstance(attachments, list):
             attachments = []
 
-        logger.info("mirror_post: text_fmt=%s, text_len=%d, attachments=%d",
-                    text_fmt, len(text), len(attachments))
-
-        # ===== Эвристика для цитат =====
-        lines = text.split('\n')
-        new_lines = []
-        modified = False
-        for line in lines:
-            stripped = line.lstrip()
-            if stripped.startswith('>'):
-                content = line[line.index('>')+1:].lstrip()
-                new_lines.append(f'<blockquote>{content}</blockquote>')
-                modified = True
-            else:
-                new_lines.append(line)
-        if modified:
-            text = '\n'.join(new_lines)
-            text_fmt = "html"
-            markup = None 
-        # ===== Конец эвристики =====
+        logger.info("mirror_post: text_fmt=%s, text_len=%d, attachments=%d, markup=%s",
+                    text_fmt, len(text), len(attachments), bool(markup))
 
         if not text.strip() and not attachments:
             logger.info("Пустое сообщение, пропускаем")
