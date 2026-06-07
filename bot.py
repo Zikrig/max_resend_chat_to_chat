@@ -714,17 +714,17 @@ class MirrorBot:
         modified = False
         for line in lines:
             stripped = line.lstrip()
-            if stripped.startswith('>'):
-                # Извлекаем содержимое после первого символа '>'
-                content = line[line.index('>')+1:].lstrip()
+            if stripped.startswith('!!'):
+                # Убираем '!!' и пробелы после, оборачиваем в blockquote
+                content = line[line.index('!!')+2:].lstrip()
                 new_lines.append(f'<blockquote>{content}</blockquote>')
                 modified = True
             else:
                 new_lines.append(line)
         if modified:
             text = '\n'.join(new_lines)
-            if text_fmt is None:
-                text_fmt = "html"
+            text_fmt = "html"
+            markup = None
         # ===== Конец эвристики =====
 
         if not text.strip() and not attachments:
