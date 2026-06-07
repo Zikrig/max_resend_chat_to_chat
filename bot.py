@@ -53,205 +53,17 @@ logger = logging.getLogger("MirrorBot")
 
 # ---------- Функции для работы с версткой ----------
 
-def normalize_text_format(raw: Any) -> Optional[str]:
-    if raw is None:
-        return None
-    if isinstance(raw, dict):
-        inner = raw.get("type") or raw.get("name") or raw.get("value") or raw.get("format")
-        if inner is not None:
-            return normalize_text_format(inner)
-        return None
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, int):
-        return None
-    s = str(raw).strip().lower().replace("-", "_")
-    if s in ("markdown", "md", "mrkdwn"):
-        return "markdown"
-    if s in ("html", "text_html"):
-        return "html"
-    return None
-
-def extract_text_format_from_body(body: Dict[str, Any]) -> Optional[str]:
-    for key in ("format", "text_format", "textFormat", "parse_mode", "parseMode", "text_style", "textStyle"):
-        if key in body:
-            fmt = normalize_text_format(body.get(key))
-            if fmt:
-                return fmt
-    return None
-
-def copy_markup_from_body(body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    raw = body.get("markup")
-    if not isinstance(raw, list) or not raw:
-        return None
-    out: List[Dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        out.append(dict(item))
-    return out or None
-
-def message_body_text_format_markup(
-    body: Dict[str, Any],
-) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    text = body.get("text") or ""
-    if not isinstance(text, str):
-        text = str(text)
-    return text, extract_text_format_from_body(body), copy_markup_from_body(body)
-
-_MARKUP_TYPE_TO_MARKDOWN: Dict[str, Tuple[str, str]] = {
-    "emphasized": ("*", "*"),
-    "emphasis": ("*", "*"),
-    "em": ("*", "*"),
-    "italic": ("*", "*"),
-    "strong": ("**", "**"),
-    "bold": ("**", "**"),
-    "strikethrough": ("~~", "~~"),
-    "underline": ("++", "++"),
-    "code": ("`", "`"),
-    "monospace": ("`", "`"),
-}
-
-_MARKUP_TYPE_TO_HTML: Dict[str, Tuple[str, str]] = {
-    "emphasized": ("<i>", "</i>"),
-    "emphasis": ("<i>", "</i>"),
-    "em": ("<i>", "</i>"),
-    "italic": ("<i>", "</i>"),
-    "strong": ("<b>", "</b>"),
-    "bold": ("<b>", "</b>"),
-    "strikethrough": ("<s>", "</s>"),
-    "underline": ("<u>", "</u>"),
-    "code": ("<code>", "</code>"),
-    "monospace": ("<code>", "</code>"),
-}
-
-def _html_pair_for_span_type(typ: str) -> Optional[Tuple[str, str]]:
-    return _MARKUP_TYPE_TO_HTML.get((typ or "").strip().lower())
-def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
-    for key in ("url", "link", "href", "uri", "target"):
-        v = s.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-def _heading_level_from_type_and_dict(typ: str, s: Dict[str, Any]) -> Optional[int]:
-    raw = (typ or "").strip().lower()
-    # "heading_2" -> 2
-    m = re.match(r"^heading[_\s-]?(\d)$", raw)
-    if m:
-        return max(1, min(6, int(m.group(1))))
-    # "h3" -> 3
-    if len(raw) == 2 and raw[0] == "h" and raw[1].isdigit():
-        return max(1, min(6, int(raw[1])))
-    # Поля в словаре: level, depth, size
-    for key in ("level", "depth", "size", "header_level"):
-        v = s.get(key)
-        if v is not None:
-            try:
-                return max(1, min(6, int(v)))
-            except (TypeError, ValueError):
-                continue
-    # Если ничего не нашли, но тип явно заголовок — уровень 1
-    if raw in ("heading", "header", "title"):
-        return 1
-    return None
-
-def _span_to_html_replacement(chunk: str, s: Dict[str, Any]) -> Optional[str]:
-    typ = str(s.get("type", "") or "").strip().lower()
-    url = _span_url_from_dict(s)
-    if url:
-        return f'<a href="{url}">{chunk}</a>'
-    if typ in ("quote", "blockquote", "citation"):
-        return f"<blockquote>{chunk}</blockquote>"
-    if typ.startswith("heading") or typ in ("header", "title"):
-        level = _heading_level_from_type_and_dict(typ, s)
-        if level is None:
-            level = 1
-        return f"<h{level}>{chunk}</h{level}>"
-    pair = _html_pair_for_span_type(typ)
-    if pair:
-        left, right = pair
-        return left + chunk + right
-    return None
-
-def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
-    """Применяет спаны, преобразуя в HTML. Заголовки применяются последними."""
-    if not text or not markup:
-        return text
-
-    # Разделяем спаны на заголовочные и остальные
-    heading_spans = []
-    other_spans = []
-    for s in markup:
-        typ = str(s.get("type", "")).lower()
-        if typ.startswith("heading") or typ in ("header", "title"):
-            heading_spans.append(s)
-        else:
-            other_spans.append(s)
-
-    # Сначала применяем все остальные стили, получаем HTML-текст
-    current_text = text
-    if other_spans:
-        # Сортируем другие спаны по убыванию длины, чтобы сначала обрабатывать самые длинные
-        other_spans_sorted = sorted(other_spans, key=lambda x: x.get("length", 0), reverse=True)
-        for s in other_spans_sorted:
-            try:
-                start = int(s["from"])
-                length = int(s["length"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if length <= 0 or start < 0 or start >= len(current_text):
-                continue
-            end = min(start + length, len(current_text))
-            chunk = current_text[start:end]
-            replacement = _span_to_html_replacement(chunk, s)  # изменённая сигнатура
-            if replacement is not None:
-                current_text = current_text[:start] + replacement + current_text[end:]
-                # Сдвиг: все последующие спаны должны быть пересчитаны. Для простоты перезапускаем процесс.
-                # Можно рекурсивно применить оставшиеся спаны, но здесь упростим: просто пересоздадим список
-                # оставшихся other_spans (кроме текущего) и применим их к новому тексту.
-                remaining = [s2 for s2 in other_spans if s2 != s]
-                if remaining:
-                    return apply_markup_spans_as_html(current_text, remaining + heading_spans)
-                else:
-                    # Применили все остальные, переходим к заголовкам
-                    break
-
-    # Теперь обрабатываем заголовки (если есть)
-    if heading_spans:
-        # Заголовки могут быть вложенными? Обычно один заголовок на диапазон.
-        # Берём самый длинный заголовок (или все по очереди)
-        for hs in heading_spans:
-            try:
-                start = int(hs["from"])
-                length = int(hs["length"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if length <= 0 or start < 0 or start >= len(current_text):
-                continue
-            end = min(start + length, len(current_text))
-            chunk = current_text[start:end]
-            replacement = _span_to_html_replacement(chunk, s)
-            if replacement is not None:
-                current_text = current_text[:start] + replacement + current_text[end:]
-                # Заголовок обернул всё, больше не обрабатываем другие заголовки
-                break
-    return current_text
-
 def normalize_outbound_message(
     text: str,
     text_format: Optional[str],
     markup: Optional[List[Dict[str, Any]]],
 ) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    # Если есть явный формат (markdown/html) от админа – используем как есть
     if text_format in ("markdown", "html"):
         return text, text_format, markup if markup else None
-    if markup:
-        html = apply_markup_spans_as_html(text, markup)
-        if html != text:
-            return html, "html", None
-        logger.warning("span→html не изменил текст, шлём markup без format")
-        return text, None, markup
-    return text, None, None
+    # Для обычных сообщений: отправляем исходный текст и markup, format не ставим
+    return text, None, markup if markup else None
+
 
 
 # ---------- Конец функций для верстки ----------
@@ -714,9 +526,8 @@ class MirrorBot:
         modified = False
         for line in lines:
             stripped = line.lstrip()
-            if stripped.startswith('!!'):
-                # Убираем '!!' и пробелы после, оборачиваем в blockquote
-                content = line[line.index('!!')+2:].lstrip()
+            if stripped.startswith('>'):
+                content = line[line.index('>')+1:].lstrip()
                 new_lines.append(f'<blockquote>{content}</blockquote>')
                 modified = True
             else:
@@ -724,7 +535,7 @@ class MirrorBot:
         if modified:
             text = '\n'.join(new_lines)
             text_fmt = "html"
-            markup = None
+            markup = None 
         # ===== Конец эвристики =====
 
         if not text.strip() and not attachments:
