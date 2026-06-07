@@ -155,7 +155,7 @@ def _heading_level_from_type_and_dict(typ: str, s: Dict[str, Any]) -> Optional[i
     if raw in ("heading", "header", "title"):
         return 1
     return None
-    
+
 def _span_to_html_replacement(chunk: str, s: Dict[str, Any]) -> Optional[str]:
     typ = str(s.get("type", "") or "").strip().lower()
     url = _span_url_from_dict(s)
@@ -204,7 +204,7 @@ def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
                 continue
             end = min(start + length, len(current_text))
             chunk = current_text[start:end]
-            replacement = _span_to_html_replacement(chunk, start, end, s)  # изменённая сигнатура
+            replacement = _span_to_html_replacement(chunk, s)  # изменённая сигнатура
             if replacement is not None:
                 current_text = current_text[:start] + replacement + current_text[end:]
                 # Сдвиг: все последующие спаны должны быть пересчитаны. Для простоты перезапускаем процесс.
