@@ -243,11 +243,16 @@ def normalize_outbound_message(
     text_format: Optional[str],
     markup: Optional[List[Dict[str, Any]]],
 ) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    # Если есть явный format (пришёл от админа через команду /admin) – используем его, markup не трогаем
     if text_format in ("markdown", "html"):
         return text, text_format, markup if markup else None
-    # Для всех остальных сообщений: отправляем исходный текст и исходный markup (если есть), без format
-    return text, None, markup if markup else None
+    if markup:
+        html = apply_markup_spans_as_html(text, markup)
+        if html != text:
+            return html, "html", None
+        logger.warning("span→html не изменил текст, шлём markup без format")
+        return text, None, markup
+    return text, None, None
+
 
 # ---------- Конец функций для верстки ----------
 
