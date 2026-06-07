@@ -715,15 +715,16 @@ class MirrorBot:
         for line in lines:
             stripped = line.lstrip()
             if stripped.startswith('>'):
+                # Извлекаем содержимое после первого символа '>'
                 content = line[line.index('>')+1:].lstrip()
-                new_lines.append(f'> {content}')
+                new_lines.append(f'<blockquote>{content}</blockquote>')
                 modified = True
             else:
                 new_lines.append(line)
         if modified:
             text = '\n'.join(new_lines)
             if text_fmt is None:
-                text_fmt = "markdown"
+                text_fmt = "html"
         # ===== Конец эвристики =====
 
         if not text.strip() and not attachments:
