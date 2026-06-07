@@ -112,52 +112,56 @@ _MARKUP_TYPE_TO_MARKDOWN: Dict[str, Tuple[str, str]] = {
     "monospace": ("`", "`"),
 }
 
-def _markdown_pair_for_span_type(typ: str) -> Optional[Tuple[str, str]]:
-    return _MARKUP_TYPE_TO_MARKDOWN.get((typ or "").strip().lower())
+_MARKUP_TYPE_TO_HTML: Dict[str, Tuple[str, str]] = {
+    "emphasized": ("<i>", "</i>"),
+    "emphasis": ("<i>", "</i>"),
+    "em": ("<i>", "</i>"),
+    "italic": ("<i>", "</i>"),
+    "strong": ("<b>", "</b>"),
+    "bold": ("<b>", "</b>"),
+    "strikethrough": ("<s>", "</s>"),
+    "underline": ("<u>", "</u>"),
+    "code": ("<code>", "</code>"),
+    "monospace": ("<code>", "</code>"),
+}
 
+def _html_pair_for_span_type(typ: str) -> Optional[Tuple[str, str]]:
+    return _MARKUP_TYPE_TO_HTML.get((typ or "").strip().lower())
 def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
     for key in ("url", "link", "href", "uri", "target"):
         v = s.get(key)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
-
-def _span_to_markdown_replacement(out: str, start: int, end: int, s: Dict[str, Any]) -> Optional[str]:
+    
+def _span_to_html_replacement(out: str, start: int, end: int, s: Dict[str, Any]) -> Optional[str]:
     chunk = out[start:end]
     typ = str(s.get("type", "") or "").strip().lower()
 
-    # Ссылка (приоритет)
     url = _span_url_from_dict(s)
     if url:
-        return f"[{chunk}]({url})"
+        return f'<a href="{url}">{chunk}</a>'
 
-    # Цитата (если вдруг придёт)
+    # Цитата (если вдруг)
     if typ in ("quote", "blockquote", "citation"):
-        return "\n".join("> " + line for line in chunk.split("\n"))
+        return f"<blockquote>{chunk}</blockquote>"
 
-    # Заголовок -> преобразуем в жирный текст (strong), чтобы сохранить вложенные стили
+    # Заголовок -> жирный + возможно увеличение шрифта, но для простоты сделаем <b>
     if typ.startswith("heading") or typ in ("header", "title"):
-        pair = _markdown_pair_for_span_type("strong")
-        if pair:
-            left, right = pair
-            return left + chunk + right
+        return f"<b>{chunk}</b>"
 
-    # Обычные стили
-    pair = _markdown_pair_for_span_type(typ)
+    pair = _html_pair_for_span_type(typ)
     if pair:
         left, right = pair
         return left + chunk + right
 
     return None
 
-def apply_markup_spans_as_markdown(text: str, markup: List[Dict[str, Any]]) -> str:
-    """
-    Применяет спаны последовательно, начиная с самых длинных, чтобы не ломать вложенность.
-    """
+def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
+    """Рекурсивно применяет спаны, преобразуя в HTML."""
     if not text or not markup:
         return text
 
-    # Подготовка спанов: сортируем по убыванию длины (самые длинные первыми)
     spans = []
     for s in markup:
         try:
@@ -171,19 +175,17 @@ def apply_markup_spans_as_markdown(text: str, markup: List[Dict[str, Any]]) -> s
         spans.append((start, end, s))
     if not spans:
         return text
-    spans.sort(key=lambda x: x[1] - x[0], reverse=True)  # по убыванию длины
+    spans.sort(key=lambda x: x[1] - x[0], reverse=True)
 
     out = text
-    # Для каждого спана применяем замену, рекурсивно обрабатывая оставшиеся спаны
     for start, end, s in spans:
-        replacement = _span_to_markdown_replacement(out, start, end, s)
+        replacement = _span_to_html_replacement(out, start, end, s)
         if replacement is None:
             continue
         new_out = out[:start] + replacement + out[end:]
-        # Оставшиеся спаны (кроме текущего) применяем к новому тексту
         remaining = [span_data for span_data in markup if span_data != s]
         if remaining:
-            return apply_markup_spans_as_markdown(new_out, remaining)
+            return apply_markup_spans_as_html(new_out, remaining)
         else:
             return new_out
     return out
@@ -196,13 +198,12 @@ def normalize_outbound_message(
     if text_format in ("markdown", "html"):
         return text, text_format, markup if markup else None
     if markup:
-        md = apply_markup_spans_as_markdown(text, markup)
-        if md != text:
-            return md, "markdown", None
-        logger.warning("span→markdown не изменил текст, шлём markup без format")
+        html = apply_markup_spans_as_html(text, markup)
+        if html != text:
+            return html, "html", None
+        logger.warning("span→html не изменил текст, шлём markup без format")
         return text, None, markup
     return text, None, None
-
 # ---------- Конец функций для верстки ----------
 
 def normalize_webhook_url(url: str) -> Tuple[str, str]:
@@ -446,7 +447,7 @@ class MirrorBot:
             if markup:
                 payload["markup"] = markup
                 logger.info("=== SEND_DEBUG: adding markup with %d spans", len(markup))
-                
+
             if attachments:
                 payload["attachments"] = attachments
             params = {"user_id": chat_id} if chat_id > 0 else {"chat_id": chat_id}
