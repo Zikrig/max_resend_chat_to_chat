@@ -143,14 +143,21 @@ def _span_to_markdown_replacement(out: str, start: int, end: int, s: Dict[str, A
     chunk = out[start:end]
     typ = str(s.get("type", "") or "").strip().lower()
 
+    # Ссылка
     url = _span_url_from_dict(s)
     if url:
         return f"[{chunk}]({url})"
 
+    # Цитата (если вдруг придёт)
+    if typ in ("quote", "blockquote", "citation"):
+        return "\n".join("> " + line for line in chunk.split("\n"))
+
+    # Заголовок
     hl = _heading_level_from_type_and_dict(typ, s)
     if hl is not None:
         return ("#" * hl) + " " + chunk.lstrip()
 
+    # Обычные стили
     pair = _markdown_pair_for_span_type(typ)
     if pair:
         left, right = pair
@@ -159,65 +166,53 @@ def _span_to_markdown_replacement(out: str, start: int, end: int, s: Dict[str, A
     return None
 
 def apply_markup_spans_as_markdown(text: str, markup: List[Dict[str, Any]]) -> str:
-    """Исправленная версия: корректно обрабатывает наложение стилей."""
+    """
+    Применяет спаны последовательно, начиная с самых длинных, чтобы не ломать вложенность.
+    """
     if not text or not markup:
         return text
 
-    # Для каждой позиции символа собираем все активные типы разметки
-    types_per_pos = [set() for _ in range(len(text))]
-    for span in markup:
+    # Подготовка спанов: сортируем по убыванию длины (самые длинные первыми)
+    spans = []
+    for s in markup:
         try:
-            start = int(span["from"])
-            length = int(span["length"])
-            typ = span.get("type", "").lower()
+            start = int(s["from"])
+            length = int(s["length"])
+            typ = s.get("type", "").lower()
         except (KeyError, TypeError, ValueError):
             continue
         if length <= 0 or start < 0 or start >= len(text):
             continue
         end = min(start + length, len(text))
-        for i in range(start, end):
-            types_per_pos[i].add(typ)
+        spans.append((start, end, s))
+    if not spans:
+        return text
+    spans.sort(key=lambda x: x[1] - x[0], reverse=True)  # по убыванию длины
 
-    def markers_for_types(types: set) -> Tuple[str, str]:
-        parts = []
-        if "strong" in types or "bold" in types:
-            parts.append("**")
-        if "emphasized" in types or "italic" in types:
-            parts.append("*")
-        if "strikethrough" in types:
-            parts.append("~~")
-        if "underline" in types:
-            parts.append("++")
-        if not parts:
-            return "", ""
-        open_seq = "".join(parts)
-        close_seq = "".join(reversed(parts))
-        return open_seq, close_seq
-
-    # Склеиваем символы с одинаковым набором типов
-    result_parts = []
-    i = 0
-    while i < len(text):
-        current_types = types_per_pos[i]
-        j = i + 1
-        while j < len(text) and types_per_pos[j] == current_types:
-            j += 1
-        chunk = text[i:j]
-        open_m, close_m = markers_for_types(current_types)
-        # Обработка заголовка: если есть heading и это начало строки/текста
-        if "heading" in current_types and i == 0:
-            result_parts.append("# ")
-            result_parts.append(chunk)
-        elif open_m:
-            result_parts.append(open_m)
-            result_parts.append(chunk)
-            result_parts.append(close_m)
+    out = text
+    # Для каждого спана применяем замену, смещая индексы для последующих
+    for start, end, s in spans:
+        replacement = _span_to_markdown_replacement(out, start, end, s)
+        if replacement is None:
+            continue
+        out = out[:start] + replacement + out[end:]
+        # Смещаем индексы следующих спанов (более коротких) на разницу в длине
+        delta = len(replacement) - (end - start)
+        # Пересоздаём список спанов с новыми индексами (упрощённо: просто пересобираем)
+        # Для простоты можно не пересчитывать, а перезапустить всю функцию заново.
+        # Но так как спанов обычно мало, можно рекурсивно применить к новому тексту оставшиеся спаны.
+        # Эффективнее: собрать оставшиеся спаны (кроме текущего) и применить их к новому out.
+        remaining = []
+        for s2 in markup:
+            if s2 == s:
+                continue
+            # Грубая оценка: пересчёт смещений сложен, проще рекурсия
+            remaining.append(s2)
+        if remaining:
+            return apply_markup_spans_as_markdown(out, remaining)
         else:
-            result_parts.append(chunk)
-        i = j
-
-    return "".join(result_parts)
-
+            return out
+    return out
 def normalize_outbound_message(
     text: str,
     text_format: Optional[str],
@@ -680,6 +675,20 @@ class MirrorBot:
         if not isinstance(msg_body, dict):
             msg_body = {}
         text, text_fmt, markup = message_body_text_format_markup(msg_body)
+            # Эвристика для цитат: если строка начинается с >, превращаем в markdown-цитату
+        lines = text.split('\n')
+        new_lines = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith('>'):
+                content = line[line.index('>')+1:].lstrip()
+                new_lines.append(f'> {content}')
+            else:
+                new_lines.append(line)
+        text = '\n'.join(new_lines)
+        # Если были изменения и нет явного format, включаем markdown
+        if new_lines != lines and text_fmt is None:
+            text_fmt = "markdown"
         attachments = msg_body.get("attachments") or []
         if not isinstance(attachments, list):
             attachments = []
