@@ -231,7 +231,7 @@ def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
                 continue
             end = min(start + length, len(current_text))
             chunk = current_text[start:end]
-            replacement = _span_to_html_replacement(chunk, start, end, hs)
+            replacement = _span_to_html_replacement(chunk, s)
             if replacement is not None:
                 current_text = current_text[:start] + replacement + current_text[end:]
                 # Заголовок обернул всё, больше не обрабатываем другие заголовки
