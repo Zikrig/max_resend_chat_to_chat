@@ -432,21 +432,21 @@ class MirrorBot:
         self.bot_id = data.get("user_id")
         logger.info("Logged in as bot ID %s (@%s)", self.bot_id, data.get("username"))
 
-    async def send_message(
-        self,
-        chat_id: int,
-        text: str,
-        attachments: Optional[List[Dict]] = None,
-        text_format: Optional[str] = None,
-        markup: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[Dict]:
+    async def send_message(self, chat_id, text, attachments=None, text_format=None, markup=None):
         try:
+            logger.info("=== SEND_DEBUG: before normalize: text=%r, text_format=%r, markup=%s", 
+                        text[:100], text_format, bool(markup))
             text, text_format, markup = normalize_outbound_message(text, text_format, markup)
-            payload: Dict[str, Any] = {"text": text}
+            logger.info("=== SEND_DEBUG: after normalize: text=%r, text_format=%r, markup=%s", 
+                        text[:100], text_format, bool(markup))
+            payload = {"text": text}
             if text_format in ("markdown", "html"):
                 payload["format"] = text_format
+                logger.info("=== SEND_DEBUG: setting format=%s", text_format)
             if markup:
                 payload["markup"] = markup
+                logger.info("=== SEND_DEBUG: adding markup with %d spans", len(markup))
+                
             if attachments:
                 payload["attachments"] = attachments
             params = {"user_id": chat_id} if chat_id > 0 else {"chat_id": chat_id}
