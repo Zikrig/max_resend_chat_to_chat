@@ -1,7 +1,8 @@
 """
 MAX-бот: зеркало постов из группы A в группу B с подменой строк.
 Админка: /admin (ADMIN_USER_IDS из .env).
-Верстка: конвертация спанов в HTML (format=html). Цитаты: !! в начале строки.
+Верстка: конвертация спанов в HTML (format=html) с корректной вложенностью.
+Цитаты: !! в начале строки.
 """
 
 from __future__ import annotations
@@ -143,23 +144,66 @@ def _html_tags_for_span(span: Dict[str, Any]) -> Tuple[str, str]:
     return mapping.get(typ, ("", ""))
 
 def spans_to_html(text: str, spans: List[Dict[str, Any]]) -> str:
+    """
+    Преобразует спаны в HTML-теги с корректной вложенностью.
+    Алгоритм: события открытия/закрытия -> стек -> обход текста.
+    """
     if not text or not spans:
         return text
-    # Сортируем спаны по убыванию from (чтобы обрабатывать от конца к началу)
-    sorted_spans = sorted(spans, key=lambda s: s.get("from", 0), reverse=True)
-    result = text
-    for span in sorted_spans:
+
+    events = []  # (pos, open_tag, close_tag, is_open)
+    for span in spans:
         start = span.get("from")
         length = span.get("length")
         if start is None or length is None:
             continue
-        if start < 0 or start + length > len(result):
+        if start < 0 or start + length > len(text):
             continue
         open_tag, close_tag = _html_tags_for_span(span)
         if not open_tag:
             continue
-        result = result[:start] + open_tag + result[start:start+length] + close_tag + result[start+length:]
-    return result
+        events.append((start, open_tag, close_tag, True))
+        events.append((start + length, open_tag, close_tag, False))
+
+    # Сортируем: по позиции, закрывающие раньше открывающих (чтобы правильно закрыть теги на одной позиции)
+    events.sort(key=lambda e: (e[0], 1 if e[3] else 0))
+
+    result_parts = []
+    last_pos = 0
+    stack = []  # храним close_tag для активных тегов
+
+    for pos, open_tag, close_tag, is_open in events:
+        if pos < last_pos:
+            continue  # защита от дублей
+        # Добавляем текст с last_pos до pos
+        if pos > last_pos:
+            result_parts.append(text[last_pos:pos])
+
+        if is_open:
+            result_parts.append(open_tag)
+            stack.append(close_tag)
+        else:
+            # Ищем соответствующий close_tag в стеке
+            try:
+                idx = stack.index(close_tag)
+                # Закрываем все теги от вершины до найденного
+                for _ in range(len(stack) - idx):
+                    result_parts.append(stack.pop())
+                # Теперь close_tag уже закрыт
+            except ValueError:
+                # Если не нашли, просто игнорируем (не должно быть)
+                pass
+        last_pos = pos
+
+    # Добавляем остаток текста после последнего события
+    if last_pos < len(text):
+        result_parts.append(text[last_pos:])
+
+    # Закрываем все оставшиеся теги
+    while stack:
+        result_parts.append(stack.pop())
+
+    return ''.join(result_parts)
 
 def normalize_outbound_message(
     text: str,
