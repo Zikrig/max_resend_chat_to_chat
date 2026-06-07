@@ -1,8 +1,7 @@
 """
 MAX-бот: зеркало постов из группы A в группу B с подменой строк.
 Админка: /admin (ADMIN_USER_IDS из .env).
-Верстка работает через передачу markup (без format).
-Цитаты: строка, начинающаяся с '!!', превращается в <blockquote>.
+Верстка: конвертация спанов в HTML (format=html). Цитаты: !! в начале строки.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ root_logger.addHandler(handler)
 root_logger.setLevel(logging.INFO)
 logger = logging.getLogger("MirrorBot")
 
-# ---------- Функции для работы с версткой (только извлечение) ----------
+# ---------- Функции для работы с версткой (конвертация в HTML) ----------
 
 def normalize_text_format(raw: Any) -> Optional[str]:
     if raw is None:
@@ -98,16 +97,84 @@ def message_body_text_format_markup(
         text = str(text)
     return text, extract_text_format_from_body(body), copy_markup_from_body(body)
 
+def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
+    for key in ("url", "link", "href", "uri", "target"):
+        v = s.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def _heading_level_from_span(span: Dict[str, Any]) -> int:
+    typ = span.get("type", "").lower()
+    m = re.search(r"(?:heading[_\s-]?|h)(\d)", typ)
+    if m:
+        return max(1, min(6, int(m.group(1))))
+    for key in ("level", "depth", "size", "header_level"):
+        v = span.get(key)
+        if v is not None:
+            try:
+                return max(1, min(6, int(v)))
+            except (TypeError, ValueError):
+                continue
+    if typ in ("heading", "header", "title"):
+        return 1
+    return 1
+
+def _html_tags_for_span(span: Dict[str, Any]) -> Tuple[str, str]:
+    typ = span.get("type", "").lower()
+    url = _span_url_from_dict(span)
+    if url:
+        return (f'<a href="{url}">', "</a>")
+    if typ.startswith("heading") or typ in ("header", "title"):
+        level = _heading_level_from_span(span)
+        return (f"<h{level}>", f"</h{level}>")
+    mapping = {
+        "emphasized": ("<i>", "</i>"),
+        "emphasis": ("<i>", "</i>"),
+        "em": ("<i>", "</i>"),
+        "italic": ("<i>", "</i>"),
+        "strong": ("<b>", "</b>"),
+        "bold": ("<b>", "</b>"),
+        "strikethrough": ("<s>", "</s>"),
+        "underline": ("<u>", "</u>"),
+        "code": ("<code>", "</code>"),
+        "monospace": ("<code>", "</code>"),
+    }
+    return mapping.get(typ, ("", ""))
+
+def spans_to_html(text: str, spans: List[Dict[str, Any]]) -> str:
+    if not text or not spans:
+        return text
+    # Сортируем спаны по убыванию from (чтобы обрабатывать от конца к началу)
+    sorted_spans = sorted(spans, key=lambda s: s.get("from", 0), reverse=True)
+    result = text
+    for span in sorted_spans:
+        start = span.get("from")
+        length = span.get("length")
+        if start is None or length is None:
+            continue
+        if start < 0 or start + length > len(result):
+            continue
+        open_tag, close_tag = _html_tags_for_span(span)
+        if not open_tag:
+            continue
+        result = result[:start] + open_tag + result[start:start+length] + close_tag + result[start+length:]
+    return result
+
 def normalize_outbound_message(
     text: str,
     text_format: Optional[str],
     markup: Optional[List[Dict[str, Any]]],
 ) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    # Если есть явный формат (markdown/html) от админа – используем как есть
     if text_format in ("markdown", "html"):
         return text, text_format, markup if markup else None
-    # Для обычных сообщений: отправляем исходный текст и markup, format не ставим
-    return text, None, markup if markup else None
+    if markup:
+        html_text = spans_to_html(text, markup)
+        if html_text != text:
+            return html_text, "html", None
+        logger.warning("Конвертация спанов в HTML не изменила текст, отправляем как есть")
+        return text, None, markup
+    return text, None, None
 
 # ---------- Конец функций для верстки ----------
 
