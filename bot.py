@@ -1,7 +1,7 @@
 """
 MAX-бот: зеркало постов из группы A в группу B с подменой строк.
 Админка: /admin (ADMIN_USER_IDS из .env).
-Верстка работает через передачу markup без format (без конвертации).
+Верстка работает через конвертацию спанов в HTML (format=html).
 Цитаты не поддерживаются.
 """
 
@@ -50,7 +50,7 @@ root_logger.addHandler(handler)
 root_logger.setLevel(logging.INFO)
 logger = logging.getLogger("MirrorBot")
 
-# ---------- Функции для работы с версткой (только извлечение) ----------
+# ---------- Функции для конвертации спанов в HTML ----------
 
 def normalize_text_format(raw: Any) -> Optional[str]:
     if raw is None:
@@ -98,16 +98,90 @@ def message_body_text_format_markup(
         text = str(text)
     return text, extract_text_format_from_body(body), copy_markup_from_body(body)
 
+def _span_url_from_dict(s: Dict[str, Any]) -> Optional[str]:
+    for key in ("url", "link", "href", "uri", "target"):
+        v = s.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def _html_tag_for_span_type(typ: str) -> Tuple[str, str]:
+    """Возвращает открывающий и закрывающий HTML-тег для типа спана."""
+    typ = typ.lower()
+    mapping = {
+        "emphasized": ("<i>", "</i>"),
+        "emphasis": ("<i>", "</i>"),
+        "em": ("<i>", "</i>"),
+        "italic": ("<i>", "</i>"),
+        "strong": ("<b>", "</b>"),
+        "bold": ("<b>", "</b>"),
+        "strikethrough": ("<s>", "</s>"),
+        "underline": ("<u>", "</u>"),
+        "code": ("<code>", "</code>"),
+        "monospace": ("<code>", "</code>"),
+        "heading": ("<b>", "</b>"),      # заголовок делаем жирным
+        "header": ("<b>", "</b>"),
+        "title": ("<b>", "</b>"),
+    }
+    return mapping.get(typ, ("", ""))
+
+def apply_markup_spans_as_html(text: str, markup: List[Dict[str, Any]]) -> str:
+    """
+    Преобразует спаны в HTML-теги, обрабатывая их от конца к началу,
+    чтобы корректно обрабатывать вложенность и не ломать индексы.
+    """
+    if not text or not markup:
+        return text
+
+    # Сортируем спаны по убыванию from (чтобы сначала обрабатывать те, что ближе к концу)
+    sorted_spans = sorted(markup, key=lambda s: s.get("from", 0), reverse=True)
+    result = text
+
+    for span in sorted_spans:
+        start = span.get("from")
+        length = span.get("length")
+        if start is None or length is None:
+            continue
+        if start < 0 or start + length > len(result):
+            continue
+
+        typ = span.get("type", "").lower()
+        chunk = result[start:start+length]
+
+        # Ссылка
+        url = _span_url_from_dict(span)
+        if url:
+            replacement = f'<a href="{url}">{chunk}</a>'
+            result = result[:start] + replacement + result[start+length:]
+            continue
+
+        # Обычные теги
+        open_tag, close_tag = _html_tag_for_span_type(typ)
+        if open_tag:
+            replacement = open_tag + chunk + close_tag
+            result = result[:start] + replacement + result[start+length:]
+        # Если тип не поддерживается, пропускаем (не заменяем)
+
+    return result
+
 def normalize_outbound_message(
     text: str,
     text_format: Optional[str],
     markup: Optional[List[Dict[str, Any]]],
 ) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
-    # Если есть явный format (от админа) – используем его, markup не трогаем
+    # Если уже есть явный format (markdown/html) – используем как есть
     if text_format in ("markdown", "html"):
         return text, text_format, markup if markup else None
-    # Для всех остальных: отправляем исходный текст и markup, format не ставим
-    return text, None, markup if markup else None
+    # Если есть markup, конвертируем в HTML и отправляем с format=html
+    if markup:
+        html_text = apply_markup_spans_as_html(text, markup)
+        if html_text != text:
+            return html_text, "html", None
+        # Если конвертация не изменила текст (например, неизвестные типы), отправляем как было
+        logger.warning("Конвертация спанов в HTML не изменила текст, отправляем без format")
+        return text, None, markup
+    # Нет markup – отправляем как обычный текст
+    return text, None, None
 
 # ---------- Конец функций для верстки ----------
 
