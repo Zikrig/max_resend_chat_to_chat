@@ -1,6 +1,6 @@
 """
-MAX-бот: зеркало постов из группы A в группу B с подменой строк.
-Админка: /admin (ADMIN_USER_IDS из .env).
+MAX-бот: зеркало постов из групп-источников в группы-приёмники с подменой строк.
+Поддерживает множество пар чатов. Админка: /admin (ADMIN_USER_IDS из .env).
 Верстка: конвертация спанов в HTML (format=html) с корректной вложенностью.
 Цитаты: !! в начале строки.
 """
@@ -395,9 +395,19 @@ class MirrorConfig:
 
     def reload(self) -> None:
         state = config_store.load_state(self.db_path)
-        self.source_chat_id: Optional[int] = state.get("source_chat_id")
-        self.target_chat_id: Optional[int] = state.get("target_chat_id")
+        self.pairs: List[Dict[str, Any]] = list(state.get("pairs") or [])
         self.replacements: List[Dict[str, Any]] = list(state.get("replacements") or [])
+
+    def get_pair(self, pair_id: int) -> Optional[Dict[str, Any]]:
+        return next((p for p in self.pairs if int(p["id"]) == pair_id), None)
+
+    def pairs_by_source(self, chat_id: int) -> List[Dict[str, Any]]:
+        return [
+            p for p in self.pairs
+            if p.get("enabled")
+            and p.get("source_chat_id") == chat_id
+            and p.get("target_chat_id") is not None
+        ]
 
     def enabled_rules(self) -> List[Tuple[str, str]]:
         return [
@@ -406,13 +416,25 @@ class MirrorConfig:
             if r.get("enabled") and r.get("search_text")
         ]
 
-    def set_source(self, chat_id: int) -> None:
-        config_store.save_chat_ids(self.db_path, source_chat_id=chat_id)
+    def add_pair(self) -> int:
+        pair_id = config_store.create_pair(self.db_path)
         self.reload()
+        return pair_id
 
-    def set_target(self, chat_id: int) -> None:
-        config_store.save_chat_ids(self.db_path, target_chat_id=chat_id)
+    def set_source(self, pair_id: int, chat_id: int) -> bool:
+        ok = config_store.update_pair_chats(self.db_path, pair_id, source_chat_id=chat_id)
         self.reload()
+        return ok
+
+    def set_target(self, pair_id: int, chat_id: int) -> bool:
+        ok = config_store.update_pair_chats(self.db_path, pair_id, target_chat_id=chat_id)
+        self.reload()
+        return ok
+
+    def delete_pair(self, pair_id: int) -> bool:
+        ok = config_store.delete_pair(self.db_path, pair_id)
+        self.reload()
+        return ok
 
     def add_replacement(self, search: str, replace: str) -> None:
         config_store.add_replacement(self.db_path, search, replace)
@@ -437,6 +459,7 @@ class MirrorBot:
         self.client = httpx.AsyncClient(base_url=API_BASE, headers=self.headers, timeout=60.0)
         self.bot_id: int | None = None
         self.admin_states: Dict[int, AdminState] = {}
+        self.admin_pair_context: Dict[int, int] = {}
         self._pending_replace_search: Dict[int, str] = {}
 
     def is_admin(self, user_id: int | None) -> bool:
@@ -576,33 +599,108 @@ class MirrorBot:
         info = await self.fetch_chat_by_id(chat_id)
         return rep.chat_label(chat_id, _chat_title_from_api(info))
 
-    def _reset_admin_fsm(self, user_id: int) -> None:
+    def _reset_admin_fsm(self, user_id: int, *, clear_pair_context: bool = True) -> None:
         self.admin_states[user_id] = AdminState.NONE
         self._pending_replace_search.pop(user_id, None)
+        if clear_pair_context:
+            self.admin_pair_context.pop(user_id, None)
 
-    async def send_admin_menu(
+    def _set_pair_context(self, user_id: int, pair_id: int) -> None:
+        self.admin_pair_context[user_id] = pair_id
+
+    def _pair_context(self, user_id: int) -> Optional[int]:
+        return self.admin_pair_context.get(user_id)
+
+    async def _cancel_to_context_menu(
         self,
         user_id: int,
         *,
         edit_message_id: Optional[str] = None,
         prepend: Optional[str] = None,
     ) -> None:
-        src_label = await self.chat_label_for_id(self.config.source_chat_id)
-        tgt_label = await self.chat_label_for_id(self.config.target_chat_id)
+        pair_id = self._pair_context(user_id)
+        state = self.admin_states.get(user_id, AdminState.NONE)
+        if state in (AdminState.AWAITING_REPLACE_SEARCH, AdminState.AWAITING_REPLACE_REPLACE):
+            self._reset_admin_fsm(user_id, clear_pair_context=False)
+            await self.send_replacements_menu(user_id, edit_message_id=edit_message_id, prepend=prepend)
+            return
+        if pair_id is not None:
+            self._reset_admin_fsm(user_id, clear_pair_context=False)
+            await self.send_pair_menu(user_id, pair_id, edit_message_id=edit_message_id, prepend=prepend)
+            return
+        self._reset_admin_fsm(user_id)
+        await self.send_pairs_menu(user_id, edit_message_id=edit_message_id, prepend=prepend)
+
+    async def send_pairs_menu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        lines = [rep.ADMIN_PAIRS_TITLE, "", rep.ADMIN_PAIRS_HEADER]
+        if not self.config.pairs:
+            lines.append(rep.ADMIN_PAIRS_EMPTY)
+        else:
+            for p in self.config.pairs:
+                src_label = await self.chat_label_for_id(p.get("source_chat_id"))
+                tgt_label = await self.chat_label_for_id(p.get("target_chat_id"))
+                lines.append(rep.pair_list_line(int(p["id"]), src_label, tgt_label))
+        lines.append("")
+        lines.append(rep.ADMIN_REPLACEMENTS_COUNT.format(n=len(self.config.replacements)))
+        if prepend:
+            lines = [prepend, ""] + lines
+        buttons: List[List[Dict]] = []
+        for p in self.config.pairs:
+            pid = int(p["id"])
+            src_label = await self.chat_label_for_id(p.get("source_chat_id"))
+            tgt_label = await self.chat_label_for_id(p.get("target_chat_id"))
+            buttons.append([
+                {
+                    "type": "callback",
+                    "text": rep.pair_button_label(src_label, tgt_label, pid),
+                    "payload": f"adm_pair:{pid}",
+                }
+            ])
+        buttons.append([{"type": "callback", "text": rep.BTN_ADD_PAIR, "payload": "adm_add_pair"}])
+        buttons.append([{"type": "callback", "text": rep.BTN_REPLACEMENTS, "payload": "adm_replacements"}])
+        await self.show_menu_or_edit(
+            user_id,
+            "\n".join(lines),
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
+
+    async def send_pair_menu(
+        self,
+        user_id: int,
+        pair_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        pair = self.config.get_pair(pair_id)
+        if not pair:
+            self._reset_admin_fsm(user_id)
+            await self.send_pairs_menu(user_id, edit_message_id=edit_message_id, prepend=rep.PAIR_NOT_FOUND)
+            return
+        self._set_pair_context(user_id, pair_id)
+        src_label = await self.chat_label_for_id(pair.get("source_chat_id"))
+        tgt_label = await self.chat_label_for_id(pair.get("target_chat_id"))
         lines = [
-            rep.ADMIN_MENU_TITLE,
+            rep.PAIR_MENU_TITLE.format(pair_id=pair_id),
             "",
             rep.ADMIN_STATUS_HEADER,
             rep.ADMIN_SOURCE_LINE.format(label=src_label),
             rep.ADMIN_TARGET_LINE.format(label=tgt_label),
-            rep.ADMIN_REPLACEMENTS_COUNT.format(n=len(self.config.replacements)),
         ]
         if prepend:
             lines = [prepend, ""] + lines
         buttons = [
-            [{"type": "callback", "text": rep.BTN_SET_SOURCE, "payload": "adm_set_source"}],
-            [{"type": "callback", "text": rep.BTN_SET_TARGET, "payload": "adm_set_target"}],
-            [{"type": "callback", "text": rep.BTN_REPLACEMENTS, "payload": "adm_replacements"}],
+            [{"type": "callback", "text": rep.BTN_SET_SOURCE, "payload": f"adm_set_source:{pair_id}"}],
+            [{"type": "callback", "text": rep.BTN_SET_TARGET, "payload": f"adm_set_target:{pair_id}"}],
+            [{"type": "callback", "text": rep.BTN_DELETE_PAIR, "payload": f"adm_del_pair:{pair_id}"}],
+            [{"type": "callback", "text": rep.BTN_BACK, "payload": "adm_pairs"}],
         ]
         await self.show_menu_or_edit(
             user_id,
@@ -648,7 +746,7 @@ class MirrorBot:
                     {"type": "callback", "text": "Удалить", "payload": f"adm_del:{rid}"},
                 ]
             )
-        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "adm_menu"}])
+        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "adm_pairs"}])
         await self.show_menu_or_edit(
             user_id,
             "\n".join(lines),
@@ -656,11 +754,11 @@ class MirrorBot:
             edit_message_id=edit_message_id,
         )
 
-    async def mirror_post(self, msg: Dict[str, Any]) -> None:
-        source = self.config.source_chat_id
-        target = self.config.target_chat_id
+    async def mirror_post(self, msg: Dict[str, Any], pair: Dict[str, Any]) -> None:
+        source = pair.get("source_chat_id")
+        target = pair.get("target_chat_id")
         if source is None or target is None:
-            logger.warning("Зеркало не настроено: source=%s target=%s", source, target)
+            logger.warning("Зеркало #%s не настроено: source=%s target=%s", pair.get("id"), source, target)
             return
 
         msg_body = msg.get("body") or {}
@@ -736,9 +834,12 @@ class MirrorBot:
         if sender_id and self.bot_id and sender_id == self.bot_id:
             return
 
-        if chat_id is not None and chat_id == self.config.source_chat_id:
-            await self.mirror_post(msg)
-            return
+        if chat_id is not None:
+            pairs = self.config.pairs_by_source(chat_id)
+            if pairs:
+                for pair in pairs:
+                    await self.mirror_post(msg, pair)
+                return
 
         if sender_id is None:
             return
@@ -755,7 +856,7 @@ class MirrorBot:
                 await self.send_message(sender_id, rep.MASTER_ONLY_ADMIN_CMD)
                 return
             self._reset_admin_fsm(sender_id)
-            await self.send_admin_menu(sender_id)
+            await self.send_pairs_menu(sender_id)
             return
 
         if self.is_admin(sender_id):
@@ -763,24 +864,39 @@ class MirrorBot:
 
     async def process_admin_text(self, sender_id: int, text: str) -> None:
         state = self.admin_states.get(sender_id, AdminState.NONE)
+        pair_id = self._pair_context(sender_id)
         if state == AdminState.AWAITING_SOURCE:
+            if pair_id is None:
+                self._reset_admin_fsm(sender_id)
+                await self.send_pairs_menu(sender_id, prepend=rep.PAIR_NOT_FOUND)
+                return
             cid, _, err = await self.resolve_chat_from_input(text)
             if err or cid is None:
                 await self.send_message(sender_id, err or rep.EMPTY_INPUT)
                 return
-            self.config.set_source(cid)
-            self._reset_admin_fsm(sender_id)
-            await self.send_admin_menu(sender_id, prepend=rep.SOURCE_SAVED.format(cid=cid))
+            if not self.config.set_source(pair_id, cid):
+                self._reset_admin_fsm(sender_id)
+                await self.send_pairs_menu(sender_id, prepend=rep.PAIR_NOT_FOUND)
+                return
+            self._reset_admin_fsm(sender_id, clear_pair_context=False)
+            await self.send_pair_menu(sender_id, pair_id, prepend=rep.SOURCE_SAVED.format(cid=cid))
             return
 
         if state == AdminState.AWAITING_TARGET:
+            if pair_id is None:
+                self._reset_admin_fsm(sender_id)
+                await self.send_pairs_menu(sender_id, prepend=rep.PAIR_NOT_FOUND)
+                return
             cid, _, err = await self.resolve_chat_from_input(text)
             if err or cid is None:
                 await self.send_message(sender_id, err or rep.EMPTY_INPUT)
                 return
-            self.config.set_target(cid)
-            self._reset_admin_fsm(sender_id)
-            await self.send_admin_menu(sender_id, prepend=rep.TARGET_SAVED.format(cid=cid))
+            if not self.config.set_target(pair_id, cid):
+                self._reset_admin_fsm(sender_id)
+                await self.send_pairs_menu(sender_id, prepend=rep.PAIR_NOT_FOUND)
+                return
+            self._reset_admin_fsm(sender_id, clear_pair_context=False)
+            await self.send_pair_menu(sender_id, pair_id, prepend=rep.TARGET_SAVED.format(cid=cid))
             return
 
         if state == AdminState.AWAITING_REPLACE_SEARCH:
@@ -820,10 +936,31 @@ class MirrorBot:
             return
         callback_mid = message_mid_from_callback_update(update)
 
-        if payload == "adm_menu":
+        if payload == "adm_pairs":
             self._reset_admin_fsm(sender_id)
-            await self.send_admin_menu(sender_id, edit_message_id=callback_mid)
-        elif payload == "adm_set_source":
+            await self.send_pairs_menu(sender_id, edit_message_id=callback_mid)
+        elif payload == "adm_add_pair":
+            pair_id = self.config.add_pair()
+            self._reset_admin_fsm(sender_id, clear_pair_context=False)
+            await self.send_pair_menu(
+                sender_id,
+                pair_id,
+                edit_message_id=callback_mid,
+                prepend=rep.PAIR_ADDED.format(pair_id=pair_id),
+            )
+        elif isinstance(payload, str) and payload.startswith("adm_pair:"):
+            try:
+                pair_id = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
+            self._reset_admin_fsm(sender_id, clear_pair_context=False)
+            await self.send_pair_menu(sender_id, pair_id, edit_message_id=callback_mid)
+        elif isinstance(payload, str) and payload.startswith("adm_set_source:"):
+            try:
+                pair_id = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
+            self._set_pair_context(sender_id, pair_id)
             self.admin_states[sender_id] = AdminState.AWAITING_SOURCE
             await self.show_menu_or_edit(
                 sender_id,
@@ -831,7 +968,12 @@ class MirrorBot:
                 _prompt_cancel_keyboard("adm_cancel"),
                 edit_message_id=callback_mid,
             )
-        elif payload == "adm_set_target":
+        elif isinstance(payload, str) and payload.startswith("adm_set_target:"):
+            try:
+                pair_id = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
+            self._set_pair_context(sender_id, pair_id)
             self.admin_states[sender_id] = AdminState.AWAITING_TARGET
             await self.show_menu_or_edit(
                 sender_id,
@@ -839,8 +981,20 @@ class MirrorBot:
                 _prompt_cancel_keyboard("adm_cancel"),
                 edit_message_id=callback_mid,
             )
+        elif isinstance(payload, str) and payload.startswith("adm_del_pair:"):
+            try:
+                pair_id = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
+            if self.config.delete_pair(pair_id):
+                self._reset_admin_fsm(sender_id)
+                await self.send_pairs_menu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.PAIR_DELETED,
+                )
         elif payload == "adm_replacements":
-            self._reset_admin_fsm(sender_id)
+            self._reset_admin_fsm(sender_id, clear_pair_context=False)
             await self.send_replacements_menu(sender_id, edit_message_id=callback_mid)
         elif payload == "adm_add_repl":
             self.admin_states[sender_id] = AdminState.AWAITING_REPLACE_SEARCH
@@ -851,8 +1005,11 @@ class MirrorBot:
                 edit_message_id=callback_mid,
             )
         elif payload == "adm_cancel":
-            self._reset_admin_fsm(sender_id)
-            await self.send_admin_menu(sender_id, edit_message_id=callback_mid, prepend=rep.MSG_PROMPT_CANCELLED)
+            await self._cancel_to_context_menu(
+                sender_id,
+                edit_message_id=callback_mid,
+                prepend=rep.MSG_PROMPT_CANCELLED,
+            )
         elif isinstance(payload, str) and payload.startswith("adm_toggle:"):
             try:
                 rid = int(payload.split(":", 1)[1])
