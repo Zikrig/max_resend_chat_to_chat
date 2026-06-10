@@ -25,7 +25,7 @@ WEBHOOK_GET_DETAIL = (
 ADMIN_PAIRS_TITLE = "Админка: зеркала чатов"
 ADMIN_PAIRS_HEADER = "Настроенные зеркала:"
 ADMIN_PAIRS_EMPTY = "Зеркал пока нет."
-ADMIN_REPLACEMENTS_COUNT = "Глобальных правил подмены: {n}"
+PAIR_REPLACEMENTS_COUNT = "Правил подмены: {n}"
 
 PAIR_MENU_TITLE = "Зеркало #{pair_id}"
 ADMIN_STATUS_HEADER = "Текущие настройки"
@@ -60,7 +60,7 @@ REPLACEMENT_ADDED = "Подмена добавлена: «{search}» → «{repl
 REPLACEMENT_REMOVED = "Подмена удалена."
 REPLACEMENT_TOGGLED = "Подмена {state}."
 
-REPLACEMENTS_HEADER = "Правила подмены (сверху вниз по порядку, для всех зеркал):"
+REPLACEMENTS_HEADER = "Правила подмены для зеркала #{pair_id} (сверху вниз по порядку):"
 REPLACEMENTS_EMPTY = "Правил пока нет."
 REPLACEMENT_LINE = "{n}. [{state}] «{search}» → «{replace}»"
 

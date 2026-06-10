@@ -409,10 +409,13 @@ class MirrorConfig:
             and p.get("target_chat_id") is not None
         ]
 
-    def enabled_rules(self) -> List[Tuple[str, str]]:
+    def replacements_for_pair(self, pair_id: int) -> List[Dict[str, Any]]:
+        return [r for r in self.replacements if int(r["pair_id"]) == pair_id]
+
+    def enabled_rules_for_pair(self, pair_id: int) -> List[Tuple[str, str]]:
         return [
             (r["search_text"], r["replace_text"])
-            for r in self.replacements
+            for r in self.replacements_for_pair(pair_id)
             if r.get("enabled") and r.get("search_text")
         ]
 
@@ -436,8 +439,8 @@ class MirrorConfig:
         self.reload()
         return ok
 
-    def add_replacement(self, search: str, replace: str) -> None:
-        config_store.add_replacement(self.db_path, search, replace)
+    def add_replacement(self, pair_id: int, search: str, replace: str) -> None:
+        config_store.add_replacement(self.db_path, pair_id, search, replace)
         self.reload()
 
     def toggle_replacement(self, repl_id: int) -> bool:
@@ -622,7 +625,12 @@ class MirrorBot:
         state = self.admin_states.get(user_id, AdminState.NONE)
         if state in (AdminState.AWAITING_REPLACE_SEARCH, AdminState.AWAITING_REPLACE_REPLACE):
             self._reset_admin_fsm(user_id, clear_pair_context=False)
-            await self.send_replacements_menu(user_id, edit_message_id=edit_message_id, prepend=prepend)
+            if pair_id is not None:
+                await self.send_replacements_menu(
+                    user_id, pair_id, edit_message_id=edit_message_id, prepend=prepend
+                )
+            else:
+                await self.send_pairs_menu(user_id, edit_message_id=edit_message_id, prepend=prepend)
             return
         if pair_id is not None:
             self._reset_admin_fsm(user_id, clear_pair_context=False)
@@ -646,8 +654,6 @@ class MirrorBot:
                 src_label = await self.chat_label_for_id(p.get("source_chat_id"))
                 tgt_label = await self.chat_label_for_id(p.get("target_chat_id"))
                 lines.append(rep.pair_list_line(int(p["id"]), src_label, tgt_label))
-        lines.append("")
-        lines.append(rep.ADMIN_REPLACEMENTS_COUNT.format(n=len(self.config.replacements)))
         if prepend:
             lines = [prepend, ""] + lines
         buttons: List[List[Dict]] = []
@@ -663,7 +669,6 @@ class MirrorBot:
                 }
             ])
         buttons.append([{"type": "callback", "text": rep.BTN_ADD_PAIR, "payload": "adm_add_pair"}])
-        buttons.append([{"type": "callback", "text": rep.BTN_REPLACEMENTS, "payload": "adm_replacements"}])
         await self.show_menu_or_edit(
             user_id,
             "\n".join(lines),
@@ -693,12 +698,14 @@ class MirrorBot:
             rep.ADMIN_STATUS_HEADER,
             rep.ADMIN_SOURCE_LINE.format(label=src_label),
             rep.ADMIN_TARGET_LINE.format(label=tgt_label),
+            rep.PAIR_REPLACEMENTS_COUNT.format(n=len(self.config.replacements_for_pair(pair_id))),
         ]
         if prepend:
             lines = [prepend, ""] + lines
         buttons = [
             [{"type": "callback", "text": rep.BTN_SET_SOURCE, "payload": f"adm_set_source:{pair_id}"}],
             [{"type": "callback", "text": rep.BTN_SET_TARGET, "payload": f"adm_set_target:{pair_id}"}],
+            [{"type": "callback", "text": rep.BTN_REPLACEMENTS, "payload": f"adm_replacements:{pair_id}"}],
             [{"type": "callback", "text": rep.BTN_DELETE_PAIR, "payload": f"adm_del_pair:{pair_id}"}],
             [{"type": "callback", "text": rep.BTN_BACK, "payload": "adm_pairs"}],
         ]
@@ -712,15 +719,22 @@ class MirrorBot:
     async def send_replacements_menu(
         self,
         user_id: int,
+        pair_id: int,
         *,
         edit_message_id: Optional[str] = None,
         prepend: Optional[str] = None,
     ) -> None:
-        lines = [rep.REPLACEMENTS_HEADER]
-        if not self.config.replacements:
+        if not self.config.get_pair(pair_id):
+            self._reset_admin_fsm(user_id)
+            await self.send_pairs_menu(user_id, edit_message_id=edit_message_id, prepend=rep.PAIR_NOT_FOUND)
+            return
+        self._set_pair_context(user_id, pair_id)
+        pair_replacements = self.config.replacements_for_pair(pair_id)
+        lines = [rep.REPLACEMENTS_HEADER.format(pair_id=pair_id)]
+        if not pair_replacements:
             lines.append(rep.REPLACEMENTS_EMPTY)
         else:
-            for i, r in enumerate(self.config.replacements, start=1):
+            for i, r in enumerate(pair_replacements, start=1):
                 st = rep.replacement_state_word(bool(r.get("enabled")))
                 lines.append(
                     rep.REPLACEMENT_LINE.format(
@@ -733,20 +747,20 @@ class MirrorBot:
         if prepend:
             lines = [prepend, ""] + lines
         buttons: List[List[Dict]] = [
-            [{"type": "callback", "text": rep.BTN_ADD_REPLACEMENT, "payload": "adm_add_repl"}],
+            [{"type": "callback", "text": rep.BTN_ADD_REPLACEMENT, "payload": f"adm_add_repl:{pair_id}"}],
         ]
-        for r in self.config.replacements:
+        for r in pair_replacements:
             rid = int(r["id"])
             on = bool(r.get("enabled"))
             toggle = "Выкл" if on else "Вкл"
             label = f"{toggle}: {r['search_text'][:20]}"
             buttons.append(
                 [
-                    {"type": "callback", "text": label, "payload": f"adm_toggle:{rid}"},
-                    {"type": "callback", "text": "Удалить", "payload": f"adm_del:{rid}"},
+                    {"type": "callback", "text": label, "payload": f"adm_toggle:{pair_id}:{rid}"},
+                    {"type": "callback", "text": "Удалить", "payload": f"adm_del:{pair_id}:{rid}"},
                 ]
             )
-        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "adm_pairs"}])
+        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": f"adm_pair:{pair_id}"}])
         await self.show_menu_or_edit(
             user_id,
             "\n".join(lines),
@@ -794,7 +808,7 @@ class MirrorBot:
             logger.info("Пустое сообщение, пропускаем")
             return
 
-        rules = self.config.enabled_rules()
+        rules = self.config.enabled_rules_for_pair(int(pair["id"]))
         text = apply_replacements(text, rules)
         if markup:
             markup = apply_replacements_deep(markup, rules)
@@ -900,6 +914,10 @@ class MirrorBot:
             return
 
         if state == AdminState.AWAITING_REPLACE_SEARCH:
+            if pair_id is None:
+                self._reset_admin_fsm(sender_id)
+                await self.send_pairs_menu(sender_id, prepend=rep.PAIR_NOT_FOUND)
+                return
             search = text.strip()
             if not search:
                 await self.send_message(sender_id, rep.EMPTY_INPUT)
@@ -916,14 +934,18 @@ class MirrorBot:
         if state == AdminState.AWAITING_REPLACE_REPLACE:
             replace = text
             search = self._pending_replace_search.get(sender_id, "")
-            if not search:
+            if not search or pair_id is None:
                 self._reset_admin_fsm(sender_id)
-                await self.send_replacements_menu(sender_id, prepend=rep.MSG_PROMPT_CANCELLED)
+                if pair_id is not None:
+                    await self.send_replacements_menu(sender_id, pair_id, prepend=rep.MSG_PROMPT_CANCELLED)
+                else:
+                    await self.send_pairs_menu(sender_id, prepend=rep.MSG_PROMPT_CANCELLED)
                 return
-            self.config.add_replacement(search, replace)
-            self._reset_admin_fsm(sender_id)
+            self.config.add_replacement(pair_id, search, replace)
+            self._reset_admin_fsm(sender_id, clear_pair_context=False)
             await self.send_replacements_menu(
                 sender_id,
+                pair_id,
                 prepend=rep.REPLACEMENT_ADDED.format(search=search, replace=replace),
             )
 
@@ -993,10 +1015,19 @@ class MirrorBot:
                     edit_message_id=callback_mid,
                     prepend=rep.PAIR_DELETED,
                 )
-        elif payload == "adm_replacements":
+        elif isinstance(payload, str) and payload.startswith("adm_replacements:"):
+            try:
+                pair_id = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
             self._reset_admin_fsm(sender_id, clear_pair_context=False)
-            await self.send_replacements_menu(sender_id, edit_message_id=callback_mid)
-        elif payload == "adm_add_repl":
+            await self.send_replacements_menu(sender_id, pair_id, edit_message_id=callback_mid)
+        elif isinstance(payload, str) and payload.startswith("adm_add_repl:"):
+            try:
+                pair_id = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
+            self._set_pair_context(sender_id, pair_id)
             self.admin_states[sender_id] = AdminState.AWAITING_REPLACE_SEARCH
             await self.show_menu_or_edit(
                 sender_id,
@@ -1011,26 +1042,39 @@ class MirrorBot:
                 prepend=rep.MSG_PROMPT_CANCELLED,
             )
         elif isinstance(payload, str) and payload.startswith("adm_toggle:"):
+            parts = payload.split(":", 2)
+            if len(parts) != 3:
+                return
             try:
-                rid = int(payload.split(":", 1)[1])
+                pair_id = int(parts[1])
+                rid = int(parts[2])
             except ValueError:
                 return
             if self.config.toggle_replacement(rid):
-                r = next((x for x in self.config.replacements if int(x["id"]) == rid), None)
+                r = next(
+                    (x for x in self.config.replacements_for_pair(pair_id) if int(x["id"]) == rid),
+                    None,
+                )
                 st = rep.replacement_state_word(bool(r.get("enabled"))) if r else "изменена"
                 await self.send_replacements_menu(
                     sender_id,
+                    pair_id,
                     edit_message_id=callback_mid,
                     prepend=rep.REPLACEMENT_TOGGLED.format(state=st),
                 )
         elif isinstance(payload, str) and payload.startswith("adm_del:"):
+            parts = payload.split(":", 2)
+            if len(parts) != 3:
+                return
             try:
-                rid = int(payload.split(":", 1)[1])
+                pair_id = int(parts[1])
+                rid = int(parts[2])
             except ValueError:
                 return
             if self.config.delete_replacement(rid):
                 await self.send_replacements_menu(
                     sender_id,
+                    pair_id,
                     edit_message_id=callback_mid,
                     prepend=rep.REPLACEMENT_REMOVED,
                 )

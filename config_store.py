@@ -1,6 +1,6 @@
 """
-SQLite v4: множество пар зеркал A→B и глобальные правила подмены строк.
-При несовпадении версии схемы (кроме v3→v4) файл БД пересоздаётся.
+SQLite v5: множество пар зеркал A→B, у каждой пары свои правила подмены строк.
+При несовпадении версии схемы (кроме v3→v4→v5) файл БД пересоздаётся.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 BACKUP_RETENTION_SEC = 7 * 24 * 3600
 
 DEFAULT_REPLACEMENTS: List[Tuple[str, str]] = [("vk.com", "ya.ru")]
@@ -35,6 +35,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -59,7 +60,40 @@ def _drop_legacy_tables(conn: sqlite3.Connection) -> None:
         conn.execute(f"DROP TABLE IF EXISTS {name}")
 
 
+def _init_schema_v5(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mirror_pairs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_chat_id INTEGER,
+            target_chat_id INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS replacements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_id INTEGER NOT NULL REFERENCES mirror_pairs(id) ON DELETE CASCADE,
+            search_text TEXT NOT NULL,
+            replace_text TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
+        (SCHEMA_VERSION,),
+    )
+
+
 def _init_schema_v4(conn: sqlite3.Connection) -> None:
+    """Промежуточная схема v4 (для миграции)."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS schema_meta (
@@ -86,7 +120,7 @@ def _init_schema_v4(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
-        (SCHEMA_VERSION,),
+        ("4",),
     )
 
 
@@ -117,15 +151,81 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
         logger.info("Миграция v3→v4: перенесена одна пара source=%s target=%s", source, target)
 
 
-def _seed_defaults(conn: sqlite3.Connection) -> None:
-    cnt = conn.execute("SELECT COUNT(*) FROM replacements").fetchone()[0]
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    old_replacements: List[Dict[str, Any]] = []
+    try:
+        for r in conn.execute(
+            "SELECT search_text, replace_text, enabled, sort_order FROM replacements ORDER BY sort_order, id"
+        ):
+            old_replacements.append(
+                {
+                    "search_text": str(r["search_text"]),
+                    "replace_text": str(r["replace_text"]),
+                    "enabled": int(r["enabled"]),
+                    "sort_order": int(r["sort_order"]),
+                }
+            )
+    except sqlite3.OperationalError:
+        pass
+
+    pair_ids: List[int] = []
+    try:
+        for row in conn.execute("SELECT id FROM mirror_pairs ORDER BY sort_order, id"):
+            pair_ids.append(int(row["id"]))
+    except sqlite3.OperationalError:
+        pass
+
+    conn.execute("DROP TABLE IF EXISTS replacements")
+    conn.executescript(
+        """
+        CREATE TABLE replacements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_id INTEGER NOT NULL REFERENCES mirror_pairs(id) ON DELETE CASCADE,
+            search_text TEXT NOT NULL,
+            replace_text TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
+        (SCHEMA_VERSION,),
+    )
+
+    for pair_id in pair_ids:
+        if old_replacements:
+            for r in old_replacements:
+                conn.execute(
+                    """INSERT INTO replacements (pair_id, search_text, replace_text, enabled, sort_order)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (pair_id, r["search_text"], r["replace_text"], r["enabled"], r["sort_order"]),
+                )
+        else:
+            _seed_pair_defaults(conn, pair_id)
+
+    logger.info(
+        "Миграция v4→v5: %d пар, правила подмены привязаны к каждой паре",
+        len(pair_ids),
+    )
+
+
+def _seed_pair_defaults(conn: sqlite3.Connection, pair_id: int) -> None:
+    cnt = conn.execute(
+        "SELECT COUNT(*) FROM replacements WHERE pair_id = ?", (pair_id,)
+    ).fetchone()[0]
     if cnt == 0:
         for i, (search, replace) in enumerate(DEFAULT_REPLACEMENTS):
             conn.execute(
-                """INSERT INTO replacements (search_text, replace_text, enabled, sort_order)
-                   VALUES (?, ?, 1, ?)""",
-                (search, replace, i),
+                """INSERT INTO replacements (pair_id, search_text, replace_text, enabled, sort_order)
+                   VALUES (?, ?, ?, 1, ?)""",
+                (pair_id, search, replace, i),
             )
+
+
+def _seed_defaults(conn: sqlite3.Connection) -> None:
+    for row in conn.execute("SELECT id FROM mirror_pairs ORDER BY sort_order, id"):
+        _seed_pair_defaults(conn, int(row["id"]))
 
 
 def _recreate_db_file(db_path: str) -> None:
@@ -134,10 +234,10 @@ def _recreate_db_file(db_path: str) -> None:
         backup = f"{db_path}.legacy-{ts}.bak"
         try:
             os.replace(db_path, backup)
-            logger.warning("Старая БД переименована в %s, создаётся схема v4", backup)
+            logger.warning("Старая БД переименована в %s, создаётся схема v5", backup)
         except OSError:
             os.remove(db_path)
-            logger.warning("Старая БД удалена, создаётся схема v4")
+            logger.warning("Старая БД удалена, создаётся схема v5")
 
 
 def _row_to_pair(row: sqlite3.Row) -> Dict[str, Any]:
@@ -151,12 +251,12 @@ def _row_to_pair(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def open_db(db_path: str) -> sqlite3.Connection:
-    """Открывает БД v4; v3 мигрирует in-place, более старые версии пересоздаёт."""
+    """Открывает БД v5; v3/v4 мигрируют in-place, более старые версии пересоздаёт."""
     if os.path.isfile(db_path):
         conn = _connect(db_path)
         ver = _read_schema_version(conn)
         conn.close()
-        if ver is not None and ver not in (SCHEMA_VERSION, "3"):
+        if ver is not None and ver not in (SCHEMA_VERSION, "3", "4"):
             _recreate_db_file(db_path)
     conn = _connect(db_path)
     conn.execute("BEGIN IMMEDIATE")
@@ -165,13 +265,14 @@ def open_db(db_path: str) -> sqlite3.Connection:
         if ver == "3":
             _migrate_v3_to_v4(conn)
             _seed_defaults(conn)
+            _migrate_v4_to_v5(conn)
+        elif ver == "4":
+            _migrate_v4_to_v5(conn)
         elif ver != SCHEMA_VERSION:
             _drop_legacy_tables(conn)
-            _init_schema_v4(conn)
-            _seed_defaults(conn)
+            _init_schema_v5(conn)
         else:
-            _init_schema_v4(conn)
-            _seed_defaults(conn)
+            _init_schema_v5(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -193,11 +294,13 @@ def _load_pairs(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 def _load_replacements(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     replacements: List[Dict[str, Any]] = []
     for r in conn.execute(
-        "SELECT id, search_text, replace_text, enabled, sort_order FROM replacements ORDER BY sort_order, id"
+        "SELECT id, pair_id, search_text, replace_text, enabled, sort_order "
+        "FROM replacements ORDER BY pair_id, sort_order, id"
     ):
         replacements.append(
             {
                 "id": int(r["id"]),
+                "pair_id": int(r["pair_id"]),
                 "search_text": str(r["search_text"]),
                 "replace_text": str(r["replace_text"]),
                 "enabled": bool(r["enabled"]),
@@ -240,8 +343,10 @@ def create_pair(db_path: str) -> int:
                VALUES (NULL, NULL, 1, ?)""",
             (int(mx) + 1,),
         )
+        pair_id = int(cur.lastrowid)
+        _seed_pair_defaults(conn, pair_id)
         conn.commit()
-        return int(cur.lastrowid)
+        return pair_id
     except Exception:
         conn.rollback()
         raise
@@ -315,24 +420,38 @@ def toggle_pair(db_path: str, pair_id: int) -> bool:
         conn.close()
 
 
-def get_enabled_replacement_rules(db_path: str) -> List[Tuple[str, str]]:
-    state = load_state(db_path)
-    return [
-        (r["search_text"], r["replace_text"])
-        for r in state["replacements"]
-        if r["enabled"] and r["search_text"]
-    ]
+def get_enabled_replacement_rules(db_path: str, pair_id: int) -> List[Tuple[str, str]]:
+    conn = open_db(db_path)
+    try:
+        rules: List[Tuple[str, str]] = []
+        for r in conn.execute(
+            """SELECT search_text, replace_text FROM replacements
+               WHERE pair_id = ? AND enabled = 1 AND search_text != ''
+               ORDER BY sort_order, id""",
+            (pair_id,),
+        ):
+            rules.append((str(r["search_text"]), str(r["replace_text"])))
+        return rules
+    finally:
+        conn.close()
 
 
-def add_replacement(db_path: str, search_text: str, replace_text: str) -> int:
+def add_replacement(db_path: str, pair_id: int, search_text: str, replace_text: str) -> int:
     conn = open_db(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        mx = conn.execute("SELECT COALESCE(MAX(sort_order), -1) FROM replacements").fetchone()[0]
+        row = conn.execute("SELECT id FROM mirror_pairs WHERE id = ?", (pair_id,)).fetchone()
+        if not row:
+            conn.rollback()
+            raise ValueError(f"pair {pair_id} not found")
+        mx = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM replacements WHERE pair_id = ?",
+            (pair_id,),
+        ).fetchone()[0]
         cur = conn.execute(
-            """INSERT INTO replacements (search_text, replace_text, enabled, sort_order)
-               VALUES (?, ?, 1, ?)""",
-            (search_text, replace_text, int(mx) + 1),
+            """INSERT INTO replacements (pair_id, search_text, replace_text, enabled, sort_order)
+               VALUES (?, ?, ?, 1, ?)""",
+            (pair_id, search_text, replace_text, int(mx) + 1),
         )
         conn.commit()
         return int(cur.lastrowid)
