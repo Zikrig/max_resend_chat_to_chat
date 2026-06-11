@@ -330,7 +330,7 @@ def apply_replacements(text: str, rules: List[Tuple[str, str]]) -> str:
     out = text or ""
     for search, replace in rules:
         if search:
-            out = out.replace(search, replace)
+            out = re.sub(re.escape(search), replace.lower(), out, flags=re.IGNORECASE)
     return out
 
 def apply_replacements_deep(obj: Any, rules: List[Tuple[str, str]]) -> Any:
